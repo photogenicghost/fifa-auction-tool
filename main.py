@@ -178,7 +178,7 @@ def healthcheck():
 def participant_script(user_id):
     return f'''<script>
     const wsProto=location.protocol==='https:'?'wss':'ws';
-    const ws=new WebSocket(`${{wsProto}}://${{location.host}}/ws`);ws.onmessage=()=>location.reload();
+    {live_updates_js()}
     function heartbeat(){{fetch('/heartbeat',{{method:'POST',credentials:'same-origin'}}).catch(()=>{{}})}}
     heartbeat();setInterval(heartbeat,10000);
     </script>'''
@@ -187,9 +187,26 @@ def participant_script(user_id):
 def admin_script():
     return '''<script>
     const wsProto=location.protocol==='https:'?'wss':'ws';
-    const ws=new WebSocket(`${wsProto}://${location.host}/ws`);ws.onmessage=()=>location.reload();
+    ''' + live_updates_js() + '''
     setTimeout(()=>location.reload(),15000);
     </script>'''
+
+
+def live_updates_js():
+    return '''
+    let socket, retryTimer, connectedOnce=false;
+    function connectUpdates(){
+      clearTimeout(retryTimer);
+      socket=new WebSocket(`${wsProto}://${location.host}/ws`);
+      socket.onopen=()=>{if(connectedOnce)location.reload();connectedOnce=true};
+      socket.onmessage=()=>location.reload();
+      socket.onclose=()=>{retryTimer=setTimeout(connectUpdates,3000)};
+      socket.onerror=()=>socket.close();
+    }
+    connectUpdates();
+    window.addEventListener('online',()=>location.reload());
+    document.addEventListener('visibilitychange',()=>{if(!document.hidden)location.reload()});
+    '''
 
 
 def display_script(auction_id, high_bid_id, winner=False):
@@ -202,7 +219,7 @@ def display_script(auction_id, high_bid_id, winner=False):
     localStorage.setItem('auctionId',auctionId);localStorage.setItem('highBidId',highBidId);
     function confetti(){{const c=document.getElementById('confetti'),x=c.getContext('2d');c.width=innerWidth;c.height=innerHeight;let p=Array.from({{length:180}},()=>({{x:Math.random()*c.width,y:-20-Math.random()*c.height,vx:(Math.random()-.5)*5,vy:2+Math.random()*5,r:3+Math.random()*5,h:Math.random()*360}}));let n=0;function f(){{x.clearRect(0,0,c.width,c.height);p.forEach(q=>{{q.x+=q.vx;q.y+=q.vy;q.vy+=.03;x.fillStyle=`hsl(${{q.h}} 85% 55%)`;x.fillRect(q.x,q.y,q.r,q.r)}});if(n++<240)requestAnimationFrame(f)}}f()}}
     if({str(winner).lower()}){{confetti();tone(523,.25);setTimeout(()=>tone(659,.25),250);setTimeout(()=>tone(784,.45),500)}}
-    const wsProto=location.protocol==='https:'?'wss':'ws';const ws=new WebSocket(`${{wsProto}}://${{location.host}}/ws`);ws.onmessage=()=>location.reload();
+    const wsProto=location.protocol==='https:'?'wss':'ws';{live_updates_js()}
     </script>'''
 
 
@@ -323,7 +340,7 @@ def admin(request:Request):
     m=mode();cutoff=time.time()-ONLINE_SECONDS;connection=db();users=connection.execute("SELECT * FROM users WHERE mode=? ORDER BY name",(m,)).fetchall();prizes=connection.execute("SELECT * FROM prizes WHERE mode=? AND quantity>0 ORDER BY name",(m,)).fetchall();bids=connection.execute("SELECT b.stamp,u.name,p.name prize,b.amount FROM bids b JOIN users u ON u.id=b.user_id JOIN auctions a ON a.id=b.auction_id JOIN prizes p ON p.id=a.prize_id WHERE a.mode=? ORDER BY b.id DESC LIMIT 50",(m,)).fetchall();winners=connection.execute("SELECT * FROM winners WHERE mode=? ORDER BY id DESC LIMIT 20",(m,)).fetchall();online=connection.execute("SELECT u.name,u.email,p.last_seen FROM user_presence p JOIN users u ON u.id=p.user_id WHERE p.mode=? AND p.last_seen>=? ORDER BY p.last_seen DESC",(m,cutoff)).fetchall();total_bids=connection.execute("SELECT COUNT(*) n FROM bids b JOIN auctions a ON a.id=b.auction_id WHERE a.mode=?",(m,)).fetchone()["n"];closed=connection.execute("SELECT COUNT(*) n FROM auctions WHERE mode=? AND status='CLOSED'",(m,)).fetchone()["n"];remaining=connection.execute("SELECT COALESCE(SUM(quantity),0) n FROM prizes WHERE mode=?",(m,)).fetchone()["n"];connection.close()
     options="".join(f'<option value="{p["id"]}">{e(p["name"])} ({p["quantity"]})</option>' for p in prizes);user_rows="".join(f'<tr><td>{e(u["name"])}</td><td>{e(u["email"])}</td><td><form method="post" action="/admin/user/update"><input type="hidden" name="user_id" value="{u["id"]}"><input type="number" name="balance" min="0" value="{u["balance"]}" style="width:100px"><button>Save</button></form></td></tr>' for u in users);bid_rows="".join(f'<tr><td>{e(x["stamp"])}</td><td>{e(x["name"])}</td><td>{e(x["prize"])}</td><td>{x["amount"]}</td></tr>' for x in bids);winner_rows="".join(f'<tr><td>{e(x["prize_name"])}</td><td>{e(x["winner_name"])}</td><td>{x["winning_bid"]}</td><td>{e(x["created_at"])}</td></tr>' for x in winners);online_rows="".join(f'<tr><td><span class="online-dot"></span>{e(x["name"])}</td><td>{e(x["email"])}</td><td>{relative_seen(x["last_seen"])}</td></tr>' for x in online)
     reset='<form method="post" action="/admin/reset-test" onsubmit="return confirm(\'Reset all TEST data?\')"><button class="danger">Reset TEST Mode</button></form>' if m=="test" else "";sound_label="Disable Sounds" if sounds_enabled() else "Enable Sounds"
-    body=f'''<h1>Admin: {m.upper()}</h1><div class="grid summary"><div class="card"><div>Connected</div><div class="metric">{len(online)}</div><small>of {len(users)}</small></div><div class="card"><div>Total Bids</div><div class="metric">{total_bids}</div></div><div class="card"><div>Auctions Closed</div><div class="metric">{closed}</div></div><div class="card"><div>Remaining Prizes</div><div class="metric">{remaining}</div></div></div><div class="card"><form method="post" action="/admin/mode"><button class="gold">Switch Test/Live</button></form>{reset}<form method="post" action="/admin/sounds"><button class="secondary">{sound_label}</button></form><form method="post" action="/admin/backup"><button class="secondary">Create Backup</button></form></div><div class="card"><h2>Connected Participants ({len(online)})</h2><table><tr><th>Name</th><th>Email</th><th>Last Activity</th></tr>{online_rows}</table></div><div class="card"><h2>Import Excel Workbook</h2><form method="post" action="/admin/import" enctype="multipart/form-data"><input type="file" name="workbook" accept=".xlsx" required><select name="action"><option value="replace">Replace current mode data</option><option value="append">Append/update current mode data</option></select><button>Import</button></form><a href="/admin/export/users">Participants CSV</a> | <a href="/admin/export/results">Results CSV</a></div><div class="card"><h2>Auction Controls</h2><form method="post" action="/admin/open"><select name="prize_id" required>{options}</select><button class="green">Open</button></form><form method="post" action="/admin/close"><button class="danger">Close and Award</button></form></div><div class="card"><h2>Participants and Balance Editing</h2><table><tr><th>Name</th><th>Email</th><th>Balance</th></tr>{user_rows}</table></div><div class="card"><h2>Bid History</h2><table><tr><th>UTC Time</th><th>Bidder</th><th>Prize</th><th>Amount</th></tr>{bid_rows}</table></div><div class="card"><h2>Winner History</h2><table><tr><th>Prize</th><th>Winner</th><th>Winning Bid</th><th>UTC Time</th></tr>{winner_rows}</table></div>'''
+    body=f'''<h1>Admin: {m.upper()}</h1><div class="grid summary"><div class="card"><div>Connected</div><div class="metric">{len(online)}</div><small>of {len(users)}</small></div><div class="card"><div>Total Bids</div><div class="metric">{total_bids}</div></div><div class="card"><div>Auctions Closed</div><div class="metric">{closed}</div></div><div class="card"><div>Remaining Prizes</div><div class="metric">{remaining}</div></div></div><div class="card"><form method="post" action="/admin/mode"><button class="gold">Switch Test/Live</button></form>{reset}<form method="post" action="/admin/sounds"><button class="secondary">{sound_label}</button></form><form method="post" action="/admin/backup"><button class="secondary">Create Backup</button></form></div><div class="card"><h2>Connected Participants ({len(online)})</h2><table><tr><th>Name</th><th>Email</th><th>Last Activity</th></tr>{online_rows}</table></div><div class="card"><h2>Import Excel Workbook</h2><form method="post" action="/admin/import" enctype="multipart/form-data"><input type="file" name="workbook" accept=".xlsx" required><select name="action"><option value="replace">Replace current mode data</option><option value="append">Append/update names; keep balances and stock</option></select><button>Import</button></form><a href="/admin/export/users">Participants CSV</a> | <a href="/admin/export/results">Results CSV</a></div><div class="card"><h2>Auction Controls</h2><form method="post" action="/admin/open"><select name="prize_id" required>{options}</select><button class="green">Open</button></form><form method="post" action="/admin/close"><button class="danger">Close and Award</button></form></div><div class="card"><h2>Participants and Balance Editing</h2><table><tr><th>Name</th><th>Email</th><th>Balance</th></tr>{user_rows}</table></div><div class="card"><h2>Bid History</h2><table><tr><th>UTC Time</th><th>Bidder</th><th>Prize</th><th>Amount</th></tr>{bid_rows}</table></div><div class="card"><h2>Winner History</h2><table><tr><th>Prize</th><th>Winner</th><th>Winning Bid</th><th>UTC Time</th></tr>{winner_rows}</table></div>'''
     return page(body+admin_script())
 
 
@@ -344,10 +361,10 @@ async def import_workbook(request:Request,workbook:UploadFile=File(...),action:s
         if action=="replace":
             if connection.execute("SELECT 1 FROM auctions WHERE mode=? AND status='OPEN'",(m,)).fetchone():raise ValueError("Close the open auction before replacing data.")
             connection.execute("DELETE FROM bids WHERE auction_id IN (SELECT id FROM auctions WHERE mode=?)",(m,));connection.execute("DELETE FROM winners WHERE mode=?",(m,));connection.execute("DELETE FROM auctions WHERE mode=?",(m,));connection.execute("DELETE FROM otp WHERE mode=?",(m,));connection.execute("DELETE FROM user_presence WHERE mode=?",(m,));connection.execute("DELETE FROM users WHERE mode=?",(m,));connection.execute("DELETE FROM prizes WHERE mode=?",(m,))
-        for name,email,points in users:connection.execute("INSERT INTO users(mode,name,email,balance) VALUES(?,?,?,?) ON CONFLICT(mode,email) DO UPDATE SET name=excluded.name,balance=excluded.balance",(m,name,email,points))
+        for name,email,points in users:connection.execute("INSERT INTO users(mode,name,email,balance) VALUES(?,?,?,?) ON CONFLICT(mode,email) DO UPDATE SET name=excluded.name",(m,name,email,points))
         for name,sku,image,quantity in prizes:
             existing=connection.execute("SELECT id FROM prizes WHERE mode=? AND sku=?",(m,sku)).fetchone()
-            if existing:connection.execute("UPDATE prizes SET name=?,image_url=?,quantity=? WHERE id=?",(name,image,quantity,existing["id"]))
+            if existing:connection.execute("UPDATE prizes SET name=?,image_url=? WHERE id=?",(name,image,existing["id"]))
             else:connection.execute("INSERT INTO prizes(mode,name,quantity,sku,image_url) VALUES(?,?,?,?,?)",(m,name,quantity,sku,image))
         connection.execute("COMMIT")
     except Exception as error:
@@ -359,7 +376,17 @@ async def import_workbook(request:Request,workbook:UploadFile=File(...),action:s
 async def update_user(request:Request,user_id:int=Form(...),balance:int=Form(...)):
     if not request.session.get("admin"):return RedirectResponse("/admin",303)
     if balance<0:return page('<div class="card"><h2>Balance cannot be negative.</h2><a href="/admin">Return</a></div>')
-    connection=db();connection.execute("UPDATE users SET balance=? WHERE id=? AND mode=?",(balance,user_id,mode()));connection.close();await hub.push();return RedirectResponse("/admin",303)
+    connection=db()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        m=mode()
+        outstanding=connection.execute("SELECT MAX(b.amount) FROM bids b JOIN auctions a ON a.id=b.auction_id WHERE b.user_id=? AND a.mode=? AND a.status='OPEN'",(user_id,m)).fetchone()[0]
+        if outstanding and balance<outstanding:raise ValueError("Balance cannot be lower than this participant's bid in the open auction.")
+        connection.execute("UPDATE users SET balance=? WHERE id=? AND mode=?",(balance,user_id,m));connection.execute("COMMIT")
+    except Exception as error:
+        connection.execute("ROLLBACK");return page(f'<div class="card"><h2>Balance update failed</h2><p>{e(error)}</p><a href="/admin">Return</a></div>')
+    finally:connection.close()
+    await hub.push();return RedirectResponse("/admin",303)
 
 
 @app.post("/admin/reset-test")
@@ -376,9 +403,16 @@ async def reset_test(request:Request):
 async def open_auction(request:Request,prize_id:int=Form(...)):
     if request.session.get("admin"):
         connection=db()
-        try:connection.execute("INSERT INTO auctions(mode,prize_id,status,opened) VALUES(?,?,'OPEN',?)",(mode(),prize_id,datetime.now(timezone.utc).isoformat()))
-        except sqlite3.IntegrityError:pass
-        connection.close();await hub.push()
+        try:
+            connection.execute("BEGIN IMMEDIATE");m=mode()
+            prize=connection.execute("SELECT 1 FROM prizes WHERE id=? AND mode=? AND quantity>0",(prize_id,m)).fetchone()
+            if not prize:raise ValueError("Choose an available prize in the current mode.")
+            if connection.execute("SELECT 1 FROM auctions WHERE mode=? AND status='OPEN'",(m,)).fetchone():raise ValueError("Close the current auction before opening another.")
+            connection.execute("INSERT INTO auctions(mode,prize_id,status,opened) VALUES(?,?,'OPEN',?)",(m,prize_id,datetime.now(timezone.utc).isoformat()));connection.execute("COMMIT")
+        except Exception as error:
+            connection.execute("ROLLBACK");return page(f'<div class="card"><h2>Could not open auction</h2><p>{e(error)}</p><a href="/admin">Return</a></div>')
+        finally:connection.close()
+        await hub.push()
     return RedirectResponse("/admin",303)
 
 
@@ -397,9 +431,11 @@ async def close_auction(request:Request):
                     connection.execute("UPDATE users SET balance=balance-? WHERE id=?",(winning["amount"],winning["user_id"]));connection.execute("UPDATE prizes SET quantity=quantity-1 WHERE id=?",(active["prize_id"],));connection.execute("UPDATE auctions SET status='CLOSED',closed=?,winner=?,winning_bid=? WHERE id=?",(closed,winning["user_id"],winning["amount"],active["id"]));connection.execute("INSERT OR REPLACE INTO winners(mode,auction_id,prize_name,winner_name,winning_bid,created_at) VALUES(?,?,?,?,?,?)",(m,active["id"],prize["name"],user["name"],winning["amount"],closed))
                 else:connection.execute("UPDATE auctions SET status='CLOSED',closed=? WHERE id=?",(closed,active["id"]))
             connection.execute("COMMIT");success=True
-        except Exception:
+        except Exception as error:
             try:connection.execute("ROLLBACK")
             except Exception:pass
+            connection.close()
+            return page(f'<div class="card"><h2>Could not close auction</h2><p>{e(error)}</p><a href="/admin">Return</a></div>')
         connection.close()
         if success:backup_db("auction_closed")
         await hub.push()
@@ -409,7 +445,16 @@ async def close_auction(request:Request):
 @app.post("/admin/mode")
 async def switch_mode(request:Request):
     if request.session.get("admin"):
-        old=mode();connection=db();connection.execute("UPDATE settings SET v=? WHERE k='mode'",("live" if old=="test" else "test",));connection.close();request.session.pop("uid",None);await hub.push()
+        connection=db()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute("SELECT 1 FROM auctions WHERE status='OPEN'").fetchone():raise ValueError("Close the open auction before switching modes.")
+            old=connection.execute("SELECT v FROM settings WHERE k='mode'").fetchone()[0]
+            connection.execute("UPDATE settings SET v=? WHERE k='mode'",("live" if old=="test" else "test",));connection.execute("COMMIT")
+        except Exception as error:
+            connection.execute("ROLLBACK");return page(f'<div class="card"><h2>Could not switch mode</h2><p>{e(error)}</p><a href="/admin">Return</a></div>')
+        finally:connection.close()
+        request.session.pop("uid",None);await hub.push()
     return RedirectResponse("/admin",303)
 
 
