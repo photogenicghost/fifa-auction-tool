@@ -1,10 +1,10 @@
-import csv, html, io, os, secrets, shutil, sqlite3, time
+import csv, html, io, os, secrets, shutil, sqlite3, time, json
 from datetime import datetime, timezone
 from pathlib import Path
 from dotenv import load_dotenv
 
 from fastapi import FastAPI, File, Form, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse, FileResponse
 from openpyxl import load_workbook
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -289,28 +289,32 @@ def logout(request:Request):
 
 @app.get("/auction")
 def auction(request:Request):
-    uid=request.session.get("uid"); touch_user(uid); connection=db(); user=connection.execute("SELECT * FROM users WHERE id=? AND mode=?",(uid,mode())).fetchone() if uid else None; connection.close()
-    if not user:return RedirectResponse("/",303)
-    active=current(); body=f'<div class="grid"><div class="card"><h2>{e(user["name"])}</h2><p>Balance</p><div class="big">{user["balance"]}</div><p><a href="/logout">Log out</a></p></div><div class="card">'
-    if active:
-        image=f'<img class="prize" src="{e(active["image_url"])}">' if active["image_url"] else ""; disabled=" disabled" if active["status"]!="OPEN" else ""
-        body+=image+f'<h3 class="{active["status"].lower()}">{active["status"]}</h3><h1>{e(active["prize"])}</h1><p>Highest bid</p><div class="big">{active["high"] or 0}</div><div class="leader">{e(active["leader"] or "No bids yet")}</div><form method="post" action="/bid" onsubmit="return confirm(\'Submit this bid?\')"><input type="number" name="amount" min="1" max="{user["balance"]}" required{disabled}><button{disabled}>Submit Bid</button></form>'
-    else:body+="<h1>No auction selected</h1>"
-    return page(body+"</div></div>"+participant_script(uid))
+    if not request.session.get("uid"):return RedirectResponse("/",303)
+    return participant_page(request)
+
 
 
 @app.post("/bid")
-async def bid(request:Request,amount:int=Form(...)):
+async def bid(request:Request,amount:int=Form(...),auction_id:int=Form(0)):
     uid=request.session.get("uid");touch_user(uid);connection=db()
     try:
         connection.execute("BEGIN IMMEDIATE");user=connection.execute("SELECT * FROM users WHERE id=? AND mode=?",(uid,mode())).fetchone();active=connection.execute("SELECT * FROM auctions WHERE mode=? AND status='OPEN'",(mode(),)).fetchone();high=connection.execute("SELECT amount FROM bids WHERE auction_id=? ORDER BY amount DESC,stamp_ns,id LIMIT 1",(active["id"],)).fetchone() if active else None
-        if not user or not active or amount<1 or amount>user["balance"] or (high and amount<=high["amount"]):raise ValueError
+        if not user:raise ValueError("Sign in with your registered email again.")
+        if not active:raise ValueError("Bidding is closed. Wait for the next prize.")
+        if auction_id!=active["id"]:raise ValueError("The prize changed. Refresh and review the prize before bidding.")
+        if amount<1:raise ValueError("Enter at least 1 point.")
+        if amount>user["balance"]:raise ValueError("This bid exceeds your available balance.")
+        if high and amount<=high["amount"]:raise ValueError(f"Another bid arrived first. Bid at least {high['amount']+1} points.")
         connection.execute("INSERT INTO bids(auction_id,user_id,amount,stamp,stamp_ns) VALUES(?,?,?,?,?)",(active["id"],uid,amount,datetime.now(timezone.utc).isoformat(),time.time_ns()));connection.execute("COMMIT")
-    except Exception:
+    except Exception as error:
         try:connection.execute("ROLLBACK")
         except Exception:pass
-        connection.close();return page('<div class="card"><h2>Bid rejected</h2><p>Check the auction status, current high bid, and available balance.</p><a href="/auction">Return</a></div>')
-    connection.close();await hub.push();return RedirectResponse("/auction",303)
+        connection.close()
+        if request.headers.get("accept")=="application/json":return JSONResponse({"ok":False,"message":str(error) if isinstance(error,ValueError) else "Bid could not be submitted. Please try again."},status_code=400)
+        return page('<div class="card"><h2>Bid rejected</h2><p>Check the auction status, current high bid, and available balance.</p><a href="/auction">Return</a></div>')
+    connection.close();await hub.push()
+    if request.headers.get("accept")=="application/json":return JSONResponse({"ok":True,"message":"Bid accepted."})
+    return RedirectResponse("/auction",303)
 
 
 @app.get("/catalog")
@@ -340,7 +344,7 @@ def admin(request:Request):
     m=mode();cutoff=time.time()-ONLINE_SECONDS;connection=db();users=connection.execute("SELECT * FROM users WHERE mode=? ORDER BY name",(m,)).fetchall();prizes=connection.execute("SELECT * FROM prizes WHERE mode=? AND quantity>0 ORDER BY name",(m,)).fetchall();bids=connection.execute("SELECT b.stamp,u.name,p.name prize,b.amount FROM bids b JOIN users u ON u.id=b.user_id JOIN auctions a ON a.id=b.auction_id JOIN prizes p ON p.id=a.prize_id WHERE a.mode=? ORDER BY b.id DESC LIMIT 50",(m,)).fetchall();winners=connection.execute("SELECT * FROM winners WHERE mode=? ORDER BY id DESC LIMIT 20",(m,)).fetchall();online=connection.execute("SELECT u.name,u.email,p.last_seen FROM user_presence p JOIN users u ON u.id=p.user_id WHERE p.mode=? AND p.last_seen>=? ORDER BY p.last_seen DESC",(m,cutoff)).fetchall();total_bids=connection.execute("SELECT COUNT(*) n FROM bids b JOIN auctions a ON a.id=b.auction_id WHERE a.mode=?",(m,)).fetchone()["n"];closed=connection.execute("SELECT COUNT(*) n FROM auctions WHERE mode=? AND status='CLOSED'",(m,)).fetchone()["n"];remaining=connection.execute("SELECT COALESCE(SUM(quantity),0) n FROM prizes WHERE mode=?",(m,)).fetchone()["n"];connection.close()
     options="".join(f'<option value="{p["id"]}">{e(p["name"])} ({p["quantity"]})</option>' for p in prizes);user_rows="".join(f'<tr><td>{e(u["name"])}</td><td>{e(u["email"])}</td><td><form method="post" action="/admin/user/update"><input type="hidden" name="user_id" value="{u["id"]}"><input type="number" name="balance" min="0" value="{u["balance"]}" style="width:100px"><button>Save</button></form></td></tr>' for u in users);bid_rows="".join(f'<tr><td>{e(x["stamp"])}</td><td>{e(x["name"])}</td><td>{e(x["prize"])}</td><td>{x["amount"]}</td></tr>' for x in bids);winner_rows="".join(f'<tr><td>{e(x["prize_name"])}</td><td>{e(x["winner_name"])}</td><td>{x["winning_bid"]}</td><td>{e(x["created_at"])}</td></tr>' for x in winners);online_rows="".join(f'<tr><td><span class="online-dot"></span>{e(x["name"])}</td><td>{e(x["email"])}</td><td>{relative_seen(x["last_seen"])}</td></tr>' for x in online)
     reset='<form method="post" action="/admin/reset-test" onsubmit="return confirm(\'Reset all TEST data?\')"><button class="danger">Reset TEST Mode</button></form>' if m=="test" else "";sound_label="Disable Sounds" if sounds_enabled() else "Enable Sounds"
-    body=f'''<h1>Admin: {m.upper()}</h1><div class="grid summary"><div class="card"><div>Connected</div><div class="metric">{len(online)}</div><small>of {len(users)}</small></div><div class="card"><div>Total Bids</div><div class="metric">{total_bids}</div></div><div class="card"><div>Auctions Closed</div><div class="metric">{closed}</div></div><div class="card"><div>Remaining Prizes</div><div class="metric">{remaining}</div></div></div><div class="card"><form method="post" action="/admin/mode"><button class="gold">Switch Test/Live</button></form>{reset}<form method="post" action="/admin/sounds"><button class="secondary">{sound_label}</button></form><form method="post" action="/admin/backup"><button class="secondary">Create Backup</button></form></div><div class="card"><h2>Connected Participants ({len(online)})</h2><table><tr><th>Name</th><th>Email</th><th>Last Activity</th></tr>{online_rows}</table></div><div class="card"><h2>Import Excel Workbook</h2><form method="post" action="/admin/import" enctype="multipart/form-data"><input type="file" name="workbook" accept=".xlsx" required><select name="action"><option value="replace">Replace current mode data</option><option value="append">Append/update names; keep balances and stock</option></select><button>Import</button></form><a href="/admin/export/users">Participants CSV</a> | <a href="/admin/export/results">Results CSV</a></div><div class="card"><h2>Auction Controls</h2><form method="post" action="/admin/open"><select name="prize_id" required>{options}</select><button class="green">Open</button></form><form method="post" action="/admin/close"><button class="danger">Close and Award</button></form></div><div class="card"><h2>Participants and Balance Editing</h2><table><tr><th>Name</th><th>Email</th><th>Balance</th></tr>{user_rows}</table></div><div class="card"><h2>Bid History</h2><table><tr><th>UTC Time</th><th>Bidder</th><th>Prize</th><th>Amount</th></tr>{bid_rows}</table></div><div class="card"><h2>Winner History</h2><table><tr><th>Prize</th><th>Winner</th><th>Winning Bid</th><th>UTC Time</th></tr>{winner_rows}</table></div>'''
+    body=f'''<h1>Admin: {m.upper()}</h1><div class="grid summary"><div class="card"><div>Connected</div><div class="metric">{len(online)}</div><small>of {len(users)}</small></div><div class="card"><div>Total Bids</div><div class="metric">{total_bids}</div></div><div class="card"><div>Auctions Closed</div><div class="metric">{closed}</div></div><div class="card"><div>Remaining Prizes</div><div class="metric">{remaining}</div></div></div><div class="card"><form method="post" action="/admin/mode"><button class="gold">Switch Test/Live</button></form>{reset}<form method="post" action="/admin/sounds"><button class="secondary">{sound_label}</button></form><form method="post" action="/admin/backup"><button class="secondary">Download Backup</button></form></div><div class="card"><h2>Connected Participants ({len(online)})</h2><table><tr><th>Name</th><th>Email</th><th>Last Activity</th></tr>{online_rows}</table></div><div class="card"><h2>Import Excel Workbook</h2><form method="post" action="/admin/import/preview" enctype="multipart/form-data"><input type="file" name="workbook" accept=".xlsx" required><select name="action"><option value="replace">Replace current mode data</option><option value="append">Append/update names; keep balances and stock</option></select><button>Preview Import</button></form><a href="/admin/export/users">Participants CSV</a> | <a href="/admin/export/results">Results CSV</a></div><div class="card"><h2>Auction Controls</h2><form method="post" action="/admin/open"><select name="prize_id" required>{options}</select><button class="green">Open</button></form><form method="post" action="/admin/close/preview"><button class="danger">Close and Award</button></form></div><div class="card"><h2>Participants and Balance Editing</h2><table><tr><th>Name</th><th>Email</th><th>Balance</th></tr>{user_rows}</table></div><div class="card"><h2>Bid History</h2><table><tr><th>UTC Time</th><th>Bidder</th><th>Prize</th><th>Amount</th></tr>{bid_rows}</table></div><div class="card"><h2>Winner History</h2><table><tr><th>Prize</th><th>Winner</th><th>Winning Bid</th><th>UTC Time</th></tr>{winner_rows}</table></div>'''
     return page(body+admin_script())
 
 
@@ -350,14 +354,16 @@ def admin_login(request:Request,password:str=Form(...)):
     return RedirectResponse("/admin",303)
 
 
-@app.post("/admin/import")
-async def import_workbook(request:Request,workbook:UploadFile=File(...),action:str=Form("replace")):
+async def import_workbook(request:Request,workbook:UploadFile=File(...),action:str=Form("replace"),confirmed:bool=False,expected_mode:str=""):
     if not request.session.get("admin"):return RedirectResponse("/admin",303)
+    if not confirmed:return page('<div class="card"><h2>Preview the workbook before importing.</h2><a href="/admin">Return</a></div>')
     try:users,prizes,warnings=parse_xlsx(await workbook.read())
     except Exception as error:return page(f'<div class="card"><h2>Import failed</h2><p>{e(error)}</p><a href="/admin">Return</a></div>')
     backup_db("before_import");m=mode();connection=db()
     try:
         connection.execute("BEGIN IMMEDIATE")
+        actual_mode=connection.execute("SELECT v FROM settings WHERE k='mode'").fetchone()[0]
+        if actual_mode!=expected_mode or m!=expected_mode:raise ValueError("Mode changed. Preview the workbook again.")
         if action=="replace":
             if connection.execute("SELECT 1 FROM auctions WHERE mode=? AND status='OPEN'",(m,)).fetchone():raise ValueError("Close the open auction before replacing data.")
             connection.execute("DELETE FROM bids WHERE auction_id IN (SELECT id FROM auctions WHERE mode=?)",(m,));connection.execute("DELETE FROM winners WHERE mode=?",(m,));connection.execute("DELETE FROM auctions WHERE mode=?",(m,));connection.execute("DELETE FROM otp WHERE mode=?",(m,));connection.execute("DELETE FROM user_presence WHERE mode=?",(m,));connection.execute("DELETE FROM users WHERE mode=?",(m,));connection.execute("DELETE FROM prizes WHERE mode=?",(m,))
@@ -417,13 +423,15 @@ async def open_auction(request:Request,prize_id:int=Form(...)):
 
 
 @app.post("/admin/close")
-async def close_auction(request:Request):
+async def close_auction(request:Request,auction_id:int=Form(0),bid_id:int=Form(-1)):
     if request.session.get("admin"):
         m=mode();connection=db();success=False
         try:
             connection.execute("BEGIN IMMEDIATE");active=connection.execute("SELECT * FROM auctions WHERE mode=? AND status='OPEN'",(m,)).fetchone()
             if active:
+                if auction_id!=active["id"]:raise ValueError("The auction changed. Review the award again.")
                 winning=connection.execute("SELECT * FROM bids WHERE auction_id=? ORDER BY amount DESC,stamp_ns,id LIMIT 1",(active["id"],)).fetchone();closed=datetime.now(timezone.utc).isoformat()
+                if bid_id!=(winning["id"] if winning else 0):raise ValueError("A new bid arrived. Review the latest winner before confirming.")
                 if winning:
                     user=connection.execute("SELECT name,balance FROM users WHERE id=? AND mode=?",(winning["user_id"],m)).fetchone();prize=connection.execute("SELECT name,quantity FROM prizes WHERE id=? AND mode=?",(active["prize_id"],m)).fetchone()
                     if not user or user["balance"]<winning["amount"]:raise ValueError("Winner balance is no longer sufficient.")
@@ -468,7 +476,8 @@ async def toggle_sounds(request:Request):
 @app.post("/admin/backup")
 def manual_backup(request:Request):
     if not request.session.get("admin"):return RedirectResponse("/admin",303)
-    path=backup_db("manual");return page(f'<div class="card"><h1>Backup created</h1><p>{e(path.name if path else "No database found")}</p><a href="/admin">Return</a></div>')
+    path=backup_db("manual")
+    return FileResponse(path,media_type="application/octet-stream",filename=path.name) if path else JSONResponse({"error":"No database found"},status_code=404)
 
 
 def csv_response(rows,headers,name):
@@ -494,6 +503,103 @@ async def websocket(websocket:WebSocket):
         while True:await websocket.receive_text()
     except WebSocketDisconnect:
         if websocket in hub.clients:hub.clients.remove(websocket)
+
+
+def participant_state(request):
+    uid=request.session.get("uid");connection=db();m=mode()
+    try:
+        user=connection.execute("SELECT * FROM users WHERE id=? AND mode=?",(uid,m)).fetchone()
+        if not user:return None
+        active=current();a=dict(active) if active else None
+        personal=connection.execute("SELECT MAX(amount) FROM bids WHERE user_id=? AND auction_id=?",(uid,a["id"])).fetchone()[0] if a else None
+        leading=connection.execute("SELECT user_id FROM bids WHERE id=?",(a["high_bid_id"],)).fetchone() if a and a["high_bid_id"] else None
+        wins=[dict(x) for x in connection.execute("SELECT w.prize_name,w.winning_bid FROM winners w JOIN auctions a ON a.id=w.auction_id WHERE a.winner=? AND w.mode=? ORDER BY w.id DESC",(uid,m))]
+        return {"name":user["name"],"balance":user["balance"],"auction":a,"last_bid":personal,"leading":bool(leading and leading[0]==uid),"wins":wins}
+    finally:connection.close()
+
+
+@app.get("/api/auction")
+def auction_state(request:Request):
+    state=participant_state(request)
+    return JSONResponse(state if state else {"error":"Sign in again"},status_code=200 if state else 401,headers={"Cache-Control":"no-store"})
+
+
+def participant_page(request):
+    if not participant_state(request):return RedirectResponse("/",303)
+    return page('''<div class="grid"><div class="card"><h2 id="rep-name"></h2><p>Remaining balance</p><div class="big" id="balance"></div><p id="connection" role="status">Connecting...</p><a href="/logout">Log out</a><h3>Your prizes</h3><p id="spent"></p><ul id="wins"></ul></div>
+    <div class="card"><img id="prize-image" class="prize" hidden><h3 id="auction-status"></h3><h1 id="prize-name"></h1><p>Highest bid</p><div class="big" id="high"></div><div class="leader" id="leader"></div><p id="personal" role="status"></p>
+    <form id="bid-form"><label for="amount">Your bid in points</label><input type="number" id="amount" min="1" required inputmode="numeric"><button id="submit">Submit Bid</button><button type="button" id="next">Bid 1 point more</button></form><p id="feedback" role="status" aria-live="polite"></p></div></div>
+    <script>
+    const el=id=>document.getElementById(id);let state,busy=false,socket,retry,refreshing=false,pending=false;
+    function render(s){const a=s.auction,open=a&&a.status==='OPEN',changed=state&&((state.auction?.id||0)!==(a?.id||0));
+      if(changed){el('amount').value='';el('feedback').textContent='The prize changed. Review it before bidding.'}
+      state=s;el('rep-name').textContent=s.name;el('balance').textContent=s.balance;
+      el('auction-status').textContent=open?'Bidding open':a?'Auction closed - waiting for the next prize':'Waiting for the next prize';
+      el('prize-name').textContent=a?.prize||'';el('high').textContent=a?.high||0;el('leader').textContent=a?.leader||'No bids yet';
+      el('personal').textContent=s.last_bid?(open?(s.leading?'You are leading':'You have been outbid'):'Your last bid')+' - '+s.last_bid+' points':'You have not bid on this prize yet.';
+      el('amount').max=s.balance;const minimum=(a?.high||0)+1;el('amount').min=minimum;
+      el('submit').disabled=busy||!open;el('amount').disabled=busy||!open;el('next').disabled=busy||!open||minimum>s.balance;el('next').textContent='Bid '+minimum+' points';
+      const image=el('prize-image');image.hidden=true;if(a?.image_url){try{const u=new URL(a.image_url,location.href);if(['http:','https:'].includes(u.protocol)){image.src=u.href;image.hidden=false}}catch(e){}}
+      el('wins').replaceChildren();for(const w of s.wins){const li=document.createElement('li');li.textContent=w.prize_name+' - '+w.winning_bid+' points';el('wins').append(li)}
+      el('spent').textContent=s.wins.length?'Points spent: '+s.wins.reduce((n,w)=>n+w.winning_bid,0):'No prizes won yet.';
+    }
+    async function refresh(){if(refreshing){pending=true;return}refreshing=true;try{const r=await fetch('/api/auction',{cache:'no-store'});if(r.status===401){location.href='/';return}if(!r.ok)throw Error();render(await r.json())}catch(e){el('connection').textContent='Connection interrupted - retrying'}finally{refreshing=false;if(pending){pending=false;refresh()}}}
+    function connect(){clearTimeout(retry);socket=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws');socket.onopen=()=>{el('connection').textContent='Connected';refresh()};socket.onmessage=refresh;socket.onclose=()=>{el('connection').textContent='Reconnecting...';retry=setTimeout(connect,3000)};socket.onerror=()=>socket.close()}
+    async function submit(amount){if(busy||!state?.auction||state.auction.status!=='OPEN')return;const auction=state.auction.id;busy=true;render(state);el('feedback').textContent='Submitting...';try{const data=new URLSearchParams({amount,auction_id:auction});const r=await fetch('/bid',{method:'POST',headers:{Accept:'application/json'},body:data});const result=await r.json();el('feedback').textContent=result.message}catch(e){el('feedback').textContent='Could not confirm submission. Check your last bid before retrying.'}finally{busy=false;await refresh();if(state)render(state)}}
+    el('bid-form').onsubmit=e=>{e.preventDefault();const amount=el('amount').value;if(confirm('Submit '+amount+' points for '+state.auction.prize+'?'))submit(amount)};
+    el('next').onclick=()=>{const amount=(state.auction.high||0)+1;if(confirm('Submit '+amount+' points for '+state.auction.prize+'?'))submit(amount)};
+    function heartbeat(){fetch('/heartbeat',{method:'POST'}).catch(()=>{})}
+    window.addEventListener('online',()=>{refresh();if(!socket||socket.readyState===WebSocket.CLOSED)connect()});document.addEventListener('visibilitychange',()=>{if(!document.hidden){refresh();heartbeat();if(!socket||socket.readyState===WebSocket.CLOSED)connect()}});
+    refresh();connect();heartbeat();setInterval(heartbeat,10000);setInterval(()=>{if(!document.hidden)refresh()},15000);
+    </script>''')
+
+
+@app.post("/admin/close/preview")
+def preview_award(request:Request):
+    if not request.session.get("admin"):return RedirectResponse("/admin",303)
+    a=current()
+    if not a or a["status"]!="OPEN":return page('<h2>No open auction</h2><a href="/admin">Return</a>')
+    summary=f'Winner: {e(a["leader"])}<br>Winning bid: {a["high"]} points' if a["high_bid_id"] else 'No bids - close without awarding a prize.'
+    return page(f'<div class="card"><h1>Confirm Award</h1><h2>{e(a["prize"])}</h2><p>{summary}</p><p>A new bid arriving before confirmation requires another review.</p><form method="post" action="/admin/close"><input type="hidden" name="auction_id" value="{a["id"]}"><input type="hidden" name="bid_id" value="{a["high_bid_id"] or 0}"><button class="danger">Confirm Close and Award</button></form><a href="/admin">Cancel</a></div>')
+
+
+@app.post("/admin/import/preview")
+async def preview_import(request:Request,workbook:UploadFile=File(...),action:str=Form("replace")):
+    if not request.session.get("admin"):return RedirectResponse("/admin",303)
+    if action not in ("replace","append"):return JSONResponse({"error":"Invalid import action"},status_code=400)
+    data=await workbook.read(10*1024*1024+1)
+    if len(data)>10*1024*1024:return page('<h2>Workbook exceeds the 10 MB limit.</h2><a href="/admin">Return</a>')
+    try:users,prizes,warnings=parse_xlsx(data)
+    except Exception as error:return page(f'<h2>Preview failed</h2><p>{e(error)}</p><a href="/admin">Return</a>')
+    if not users:return page('<h2>No valid participants found. Import cancelled.</h2><a href="/admin">Return</a>')
+    folder=DATA_DIR/'import_previews';folder.mkdir(exist_ok=True)
+    for old in folder.glob('*.xlsx'):
+        if old.stat().st_mtime<time.time()-3600:old.unlink(missing_ok=True)
+    token=secrets.token_hex(24);(folder/(token+'.xlsx')).write_bytes(data)
+    request.session['import_preview']={"token":token,"mode":mode(),"action":action,"expires":time.time()+1800}
+    warning_list=''.join(f'<li>{e(x)}</li>' for x in warnings)
+    names=''.join(f'<li>{e(name)} - {e(email)} - {points} points</li>' for name,email,points in users[:10])
+    prize_names=''.join(f'<li>{e(name)} - SKU {e(sku)} - {quantity} units</li>' for name,sku,image,quantity in prizes[:10])
+    consequence='This deletes participants, prizes, bids, and winner history in the selected mode.' if action=='replace' else 'Existing balances and stock are preserved. Names and images update; new entries use workbook values.'
+    return page(f'<div class="card"><h1>Import Preview - {mode().upper()}</h1><p>{len(users)} participants; {len(prizes)} unique prizes; {sum(p[3] for p in prizes)} prize units.</p><div class="warning">{e(consequence)}</div><h3>Warnings</h3><ul>{warning_list or "<li>None</li>"}</ul><h3>First 10 participants</h3><ul>{names}</ul><h3>First 10 prizes</h3><ul>{prize_names}</ul><form method="post" action="/admin/import/confirm"><input type="hidden" name="token" value="{token}"><button>Confirm Import</button></form><a href="/admin">Cancel</a></div>')
+
+
+@app.post("/admin/import/confirm")
+async def confirm_import(request:Request,token:str=Form(...)):
+    if not request.session.get("admin"):return RedirectResponse("/admin",303)
+    preview=request.session.get('import_preview')
+    if not preview or not secrets.compare_digest(token,preview['token']) or preview['expires']<time.time() or preview['mode']!=mode():return page('<h2>Preview expired or mode changed. Preview again.</h2><a href="/admin">Return</a>')
+    path=DATA_DIR/'import_previews'/(preview['token']+'.xlsx');claimed=path.with_suffix('.claimed')
+    try:path.rename(claimed)
+    except OSError:return page('<h2>This preview was already used. Preview again.</h2><a href="/admin">Return</a>')
+    request.session.pop('import_preview',None)
+    try:
+        from starlette.datastructures import UploadFile as StoredUpload
+        upload=StoredUpload(io.BytesIO(claimed.read_bytes()),filename='preview.xlsx')
+        result=await import_workbook(request,upload,preview['action'],confirmed=True,expected_mode=preview['mode'])
+        await hub.push()
+        return result
+    finally:claimed.unlink(missing_ok=True)
 
 
 if __name__=="__main__":
