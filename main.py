@@ -328,14 +328,8 @@ def catalog(request:Request):
 
 @app.get("/display")
 def display():
-    active=current()
-    if not active:body='<div class="display"><div class="big">Auction will begin soon</div></div>';script=display_script(0,0)
-    elif active["status"]=="CLOSED" and active["winner"]:
-        connection=db();winner=connection.execute("SELECT * FROM winners WHERE mode=? AND auction_id=?",(mode(),active["id"])).fetchone();connection.close();image=f'<img class="prize" src="{e(active["image_url"])}">' if active["image_url"] else ""
-        body=f'<div class="display winner"><div class="trophy">🏆 WINNER 🏆</div>{image}<h1>{e(winner["prize_name"])}</h1><div class="leader">{e(winner["winner_name"])}</div><p>Winning Bid</p><div class="big">{winner["winning_bid"]} Points</div></div>' if winner else '<div class="display"><h1>Auction Closed</h1></div>';script=display_script(active["id"],active["high_bid_id"],True)
-    else:
-        image=f'<img class="prize" src="{e(active["image_url"])}">' if active["image_url"] else "";body=f'<div class="display">{image}<h2 class="{active["status"].lower()}">{active["status"]}</h2><h1>{e(active["prize"])}</h1><p>Highest bid</p><div class="big bid-flash">{active["high"] or 0} points</div><div class="leader">{e(active["leader"] or "No bids yet")}</div></div>';script=display_script(active["id"],active["high_bid_id"])
-    return page(body+script)
+    return display_page()
+
 
 
 @app.get("/admin")
@@ -503,6 +497,44 @@ async def websocket(websocket:WebSocket):
         while True:await websocket.receive_text()
     except WebSocketDisconnect:
         if websocket in hub.clients:hub.clients.remove(websocket)
+
+
+@app.get("/api/display")
+def display_state():
+    active=current();winner=None
+    if active and active["winner"]:
+        connection=db()
+        try:
+            row=connection.execute("SELECT prize_name,winner_name,winning_bid FROM winners WHERE auction_id=?",(active["id"],)).fetchone()
+            winner=dict(row) if row else None
+        finally:connection.close()
+    return JSONResponse({"auction":dict(active) if active else None,"winner":winner,"sounds":sounds_enabled()},headers={"Cache-Control":"no-store"})
+
+
+def display_page():
+    return page('''<div id="screen" class="display"><div id="trophy" class="trophy" hidden>🏆 WINNER 🏆</div><img id="image" class="prize" hidden><h2 id="status">Auction will begin soon</h2><h1 id="prize"></h1><p id="label"></p><div id="points" class="big"></div><div id="leader" class="leader"></div><small id="connection" role="status">Connecting...</small><button id="audio" class="secondary">Enable sounds</button></div><canvas id="confetti"></canvas>
+    <script>
+    const el=id=>document.getElementById(id);let previous=null,audio=null,soundOn=false,socket,retry,refreshing=false,pending=false,animation;
+    el('audio').onclick=async()=>{try{audio=audio||new(window.AudioContext||window.webkitAudioContext)();await audio.resume();el('audio').hidden=true}catch(e){el('audio').textContent='Sounds unavailable'}};
+    function tone(freq,duration){if(!soundOn||!audio||audio.state!=='running')return;const o=audio.createOscillator(),g=audio.createGain();o.frequency.value=freq;o.connect(g);g.connect(audio.destination);g.gain.setValueAtTime(.18,audio.currentTime);g.gain.exponentialRampToValueAtTime(.001,audio.currentTime+duration);o.start();o.stop(audio.currentTime+duration)}
+    function confetti(){cancelAnimationFrame(animation);const c=el('confetti'),x=c.getContext('2d');c.width=innerWidth;c.height=innerHeight;let n=0,p=Array.from({length:180},()=>({x:Math.random()*c.width,y:-Math.random()*c.height,vx:(Math.random()-.5)*5,vy:2+Math.random()*5,h:Math.random()*360}));function frame(){x.clearRect(0,0,c.width,c.height);p.forEach(q=>{q.x+=q.vx;q.y+=q.vy;q.vy+=.03;x.fillStyle=`hsl(${q.h} 85% 55%)`;x.fillRect(q.x,q.y,6,6)});if(n++<240)animation=requestAnimationFrame(frame);else x.clearRect(0,0,c.width,c.height)}frame()}
+    function render(s){const a=s.auction,w=s.winner,key=a?String(a.id):'none',won=!!(a&&a.status==='CLOSED'&&w);soundOn=s.sounds;
+      el('screen').classList.toggle('winner',won);el('trophy').hidden=!won;
+      el('status').textContent=!a?'Auction will begin soon':won?'Auction closed':a.status==='OPEN'?'Bidding open':'Auction closed - no bids';
+      el('status').className=a&&a.status==='OPEN'?'open':'closed';el('prize').textContent=w?.prize_name||a?.prize||'';
+      el('label').textContent=a?(won?'Winning bid':'Highest bid'):'';el('points').textContent=a?String(won?w.winning_bid:(a.high||0))+' points':'';
+      el('leader').textContent=w?.winner_name||a?.leader||(a?'No bids yet':'');el('image').hidden=true;
+      if(a?.image_url){try{const u=new URL(a.image_url,location.href);if(['http:','https:'].includes(u.protocol)){el('image').src=u.href;el('image').hidden=false}}catch(e){}}
+      if(won&&(!previous||previous.key!==key||!previous.won)){confetti();tone(523,.25);setTimeout(()=>tone(659,.25),250);setTimeout(()=>tone(784,.45),500)}
+      else if(a&&previous&&previous.key===key&&(a.high_bid_id||0)>previous.bid&&!won){el('points').classList.remove('bid-flash');void el('points').offsetWidth;el('points').classList.add('bid-flash');tone(880,.18)}
+      if(previous&&previous.key!==key&&!won){cancelAnimationFrame(animation);el('confetti').getContext('2d').clearRect(0,0,innerWidth,innerHeight)}
+      previous={key,won,bid:a?.high_bid_id||0};
+    }
+    async function refresh(){if(refreshing){pending=true;return}refreshing=true;try{const r=await fetch('/api/display',{cache:'no-store'});if(!r.ok)throw Error();render(await r.json())}catch(e){el('connection').textContent='Connection interrupted - retrying'}finally{refreshing=false;if(pending){pending=false;refresh()}}}
+    function connect(){clearTimeout(retry);socket=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws');socket.onopen=()=>{el('connection').textContent='Connected';refresh()};socket.onmessage=refresh;socket.onclose=()=>{el('connection').textContent='Reconnecting...';retry=setTimeout(connect,3000)};socket.onerror=()=>socket.close()}
+    function resume(){refresh();if(!socket||socket.readyState===WebSocket.CLOSED)connect()}
+    window.addEventListener('online',resume);document.addEventListener('visibilitychange',()=>{if(!document.hidden)resume()});refresh();connect();setInterval(()=>{if(!document.hidden)refresh()},15000);
+    </script>''')
 
 
 def participant_state(request):
