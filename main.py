@@ -46,6 +46,12 @@ def init():
     CREATE TABLE IF NOT EXISTS winners(id INTEGER PRIMARY KEY,mode TEXT,auction_id INTEGER UNIQUE,prize_name TEXT,winner_name TEXT,winning_bid INTEGER,created_at TEXT);
     CREATE TABLE IF NOT EXISTS user_presence(user_id INTEGER PRIMARY KEY,mode TEXT,last_seen REAL,login_at TEXT);
     """)
+    if "ends_at" not in {row[1] for row in connection.execute("PRAGMA table_info(auctions)")}:
+        connection.execute("ALTER TABLE auctions ADD COLUMN ends_at REAL")
+    connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_pending_auction ON auctions(mode) WHERE status IN ('READY','OPEN')")
+    for roster_mode in ("test", "live"):
+        connection.execute("INSERT OR IGNORE INTO settings(k,v) VALUES(?,?)",
+                           ("session_generation_" + roster_mode, secrets.token_hex(32)))
     connection.close()
 
 
@@ -89,16 +95,36 @@ def backup_db(reason="manual"):
     return destination
 
 
-def touch_user(user_id):
-    if not user_id:
-        return
-    current_mode = mode()
-    now = time.time()
+def session_user(request, connection, current_mode):
+    generation = connection.execute("SELECT v FROM settings WHERE k=?",
+                                    ("session_generation_" + current_mode,)).fetchone()
+    if (not generation or request.session.get("participant_mode") != current_mode
+            or request.session.get("participant_generation") != generation[0]):
+        return None
+    return connection.execute("SELECT * FROM users WHERE id=? AND mode=?",
+                              (request.session.get("uid"), current_mode)).fetchone()
+
+
+def invalidate_participants(connection, current_mode):
+    connection.execute("UPDATE settings SET v=? WHERE k=?",
+                       (secrets.token_hex(32), "session_generation_" + current_mode))
+    connection.execute("DELETE FROM user_presence WHERE mode=?", (current_mode,))
+
+
+def touch_user(request):
     connection = db()
-    connection.execute("""INSERT INTO user_presence(user_id,mode,last_seen,login_at)
-        VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET mode=excluded.mode,last_seen=excluded.last_seen""",
-        (user_id, current_mode, now, datetime.now(timezone.utc).isoformat()))
-    connection.close()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        current_mode = connection.execute("SELECT v FROM settings WHERE k='mode'").fetchone()[0]
+        user = session_user(request, connection, current_mode)
+        if user:
+            connection.execute("""INSERT INTO user_presence(user_id,mode,last_seen,login_at)
+                VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET last_seen=excluded.last_seen""",
+                (user["id"], current_mode, time.time(), datetime.now(timezone.utc).isoformat()))
+        connection.execute("COMMIT")
+        return bool(user)
+    finally:
+        connection.close()
 
 
 def relative_seen(seconds):
@@ -112,6 +138,51 @@ def relative_seen(seconds):
     return f"{age // 3600}h ago"
 
 
+def auction_clock_script():
+    return """<script>
+    let auctionClock=null,clockUntil=0;
+    function auctionIsOpen(a){return !!(a&&a.status==='OPEN'&&a.ends_at!=null&&auctionClock?.id===a.id&&performance.now()<clockUntil)}
+    function auctionStatus(a){
+      if(!a)return 'Waiting for the next prize';
+      if(a.status==='READY')return 'Item loaded - waiting to start';
+      if(a.status==='CANCELLED')return 'Auction cancelled';
+      if(a.status==='ENDED'||(a.status==='OPEN'&&!auctionIsOpen(a)))return 'Bidding closed - awaiting award';
+      return a.status==='OPEN'?'Bidding open':'Auction closed';
+    }
+    function updateAuctionClock(s){
+      auctionClock=s.auction;
+      clockUntil=performance.now()+Math.max(0,((s.auction?.ends_at||0)-s.server_now)*1000);
+      tickAuctionClock();
+    }
+    function tickAuctionClock(){
+      const a=auctionClock,t=document.getElementById('countdown');if(!t)return;
+      const open=auctionIsOpen(a),pending=a&&(a.status==='OPEN'||a.status==='ENDED');
+      t.textContent=a?.status==='READY'?'30 seconds - ready':open?Math.ceil(Math.max(0,clockUntil-performance.now())/1000)+' seconds':pending?'0 seconds - bidding closed':'';
+      const status=document.getElementById('auction-status')||document.getElementById('admin-auction-status');
+      if(status)status.textContent=auctionStatus(a);
+      const displayStatus=document.getElementById('status');
+      if(displayStatus&&pending&&!open){displayStatus.textContent=auctionStatus(a);displayStatus.className='closed'}
+      if(!open)for(const id of ['submit','amount','next']){const b=document.getElementById(id);if(b)b.disabled=true}
+      const endEarly=document.getElementById('end-bidding-early');if(endEarly)endEarly.disabled=!open;
+      const award=document.getElementById('review-award');if(award)award.disabled=!pending||open;
+    }
+    setInterval(tickAuctionClock,100);
+    </script>"""
+
+
+def auction_controls(options):
+    a=current();pending=a and a['status'] in ('READY','OPEN')
+    aid=a['id'] if pending else 0
+    return f'''<div class="card"><h2>Auction Controls</h2>
+    <h3>{e(a['prize']) if pending else 'Select a prize to load'}</h3>
+    <p id="admin-auction-status"></p><div id="countdown" class="leader" role="timer"></div>
+    <form method="post" action="/admin/load"><select name="prize_id" required aria-label="Prize to load">{options}</select><button {'disabled' if pending else ''}>Load Item</button></form>
+    <form method="post" action="/admin/start"><input type="hidden" name="auction_id" value="{aid}"><button class="green" {'disabled' if not pending or a['status']!='READY' else ''}>Start 30-Second Auction</button></form>
+    <form method="post" action="/admin/end" onsubmit="return confirm('End bidding now? The highest bid will be kept for review and award.')"><input type="hidden" name="auction_id" value="{aid}"><button id="end-bidding-early" class="danger" disabled>End Bidding Early</button></form>
+    <form method="post" action="/admin/close/preview"><button id="review-award" class="gold" disabled>Review and Award</button></form>
+    <form method="post" action="/admin/cancel" onsubmit="return confirm('Cancel this auction? No points or stock will be deducted.')"><input type="hidden" name="auction_id" value="{aid}"><button class="danger" {'disabled' if not pending else ''}>Cancel Auction</button></form></div>'''
+
+
 def page(body):
     css = """<style>
     *{box-sizing:border-box}body{margin:0;font-family:Arial;background:#f3f6fa;color:#14233a}
@@ -121,7 +192,7 @@ def page(body):
     .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:15px}.summary{grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}
     button,input,select{padding:12px;margin:5px;border-radius:8px;border:1px solid #abc;font:inherit}
     button{background:#0868d7;color:white;border:0;font-weight:bold;cursor:pointer}.danger{background:#bd2424}.green{background:#17813e}.gold{background:#f5c542;color:#111}.secondary{background:#65758b}
-    .big{font-size:clamp(2rem,8vw,5rem);font-weight:bold}.leader{font-size:clamp(1.5rem,5vw,3.5rem)}.metric{font-size:2rem;font-weight:bold}
+    button:disabled{opacity:.45;cursor:not-allowed}#countdown{font-variant-numeric:tabular-nums;margin:12px 0;color:#0868d7}.big{font-size:clamp(2rem,8vw,5rem);font-weight:bold}.leader{font-size:clamp(1.5rem,5vw,3.5rem)}.metric{font-size:2rem;font-weight:bold}
     table{width:100%;border-collapse:collapse}td,th{padding:9px;border-bottom:1px solid #ddd;text-align:left}
     .display{text-align:center}.open{color:#17813e}.closed{color:#bd2424}.prize{width:100%;height:220px;object-fit:contain}
     .trophy{font-size:clamp(2.5rem,8vw,6rem);font-weight:bold;color:#b8860b}.winner{background:linear-gradient(135deg,#fff8d8,#ffffff);padding:28px;border-radius:18px}
@@ -131,19 +202,30 @@ def page(body):
     @media(max-width:650px){table{font-size:.84rem}td,th{padding:6px}button,input,select{max-width:100%}}
     </style>"""
     nav = '<nav><b>FIFA Auction Tool</b><a href="/">Login</a><a href="/auction">Auction</a><a href="/catalog">Prizes</a><a href="/display">Display</a><a href="/admin">Admin</a></nav>'
-    return HTMLResponse(f'<!doctype html><meta name="viewport" content="width=device-width"><title>FIFA Auction Tool</title>{css}{nav}<main>{body}</main>')
+    return HTMLResponse(f'<!doctype html><meta name="viewport" content="width=device-width"><title>FIFA Auction Tool</title>{css}{auction_clock_script()}{nav}<main>{body}</main>')
 
 
-def current():
-    connection = db()
+def current(connection=None, current_mode=None):
+    owns_connection = connection is None
+    connection = connection if connection is not None else db()
     row = connection.execute("""SELECT a.*,p.name prize,p.image_url,
         (SELECT amount FROM bids WHERE auction_id=a.id ORDER BY amount DESC,stamp_ns,id LIMIT 1) high,
         (SELECT u.name FROM bids b JOIN users u ON u.id=b.user_id WHERE b.auction_id=a.id ORDER BY b.amount DESC,b.stamp_ns,b.id LIMIT 1) leader,
         (SELECT id FROM bids WHERE auction_id=a.id ORDER BY amount DESC,stamp_ns,id LIMIT 1) high_bid_id
         FROM auctions a JOIN prizes p ON p.id=a.prize_id WHERE a.mode=?
-        ORDER BY CASE a.status WHEN 'OPEN' THEN 0 ELSE 1 END,a.id DESC LIMIT 1""", (mode(),)).fetchone()
-    connection.close()
+        ORDER BY CASE WHEN a.status IN ('READY','OPEN') THEN 0 ELSE 1 END,a.id DESC LIMIT 1""", (current_mode if current_mode is not None else mode(),)).fetchone()
+    if owns_connection: connection.close()
     return row
+
+
+def auction_payload(row, now=None):
+    if not row:
+        return None
+    result = dict(row)
+    now = time.time() if now is None else now
+    if result['status'] == 'OPEN' and (result['ends_at'] is None or now >= result['ends_at']):
+        result['status'] = 'ENDED'
+    return result
 
 
 class Hub:
@@ -188,7 +270,8 @@ def admin_script():
     return '''<script>
     const wsProto=location.protocol==='https:'?'wss':'ws';
     ''' + live_updates_js() + '''
-    setTimeout(()=>location.reload(),15000);
+    async function refreshClock(){try{const r=await fetch('/api/display',{cache:'no-store'});if(r.ok)updateAuctionClock(await r.json())}catch(e){}}
+    refreshClock();setInterval(refreshClock,1000);
     </script>'''
 
 
@@ -267,23 +350,40 @@ def login():
 
 @app.post("/login")
 def participant_login(request:Request,email:str=Form(...)):
-    email=email.lower().strip(); connection=db(); user=connection.execute("SELECT id FROM users WHERE mode=? AND lower(email)=?",(mode(),email)).fetchone(); connection.close()
+    connection = db()
+    try:
+        connection.execute("BEGIN")
+        m = connection.execute("SELECT v FROM settings WHERE k='mode'").fetchone()[0]
+        user = connection.execute("SELECT id FROM users WHERE mode=? AND lower(email)=?",
+                                  (m, email.lower().strip())).fetchone()
+        generation = connection.execute("SELECT v FROM settings WHERE k=?",
+                                        ("session_generation_" + m,)).fetchone()[0]
+    finally:
+        connection.close()
     if not user: return page('<div class="card"><h2>Email not registered</h2><p>Use the email address included in the imported participant list.</p><a href="/">Try again</a></div>')
-    request.session.clear(); request.session["uid"]=user["id"]; touch_user(user["id"]); return RedirectResponse("/auction",303)
+    request.session.clear()
+    request.session.update(uid=user["id"], participant_mode=m, participant_generation=generation)
+    touch_user(request)
+    return RedirectResponse("/auction",303)
 
 
 @app.post("/heartbeat")
 def heartbeat(request:Request):
-    uid=request.session.get("uid")
-    if uid: touch_user(uid)
-    return JSONResponse({"ok":bool(uid)})
+    return JSONResponse({"ok":touch_user(request)})
 
 
 @app.get("/logout")
 def logout(request:Request):
-    uid=request.session.get("uid")
-    if uid:
-        connection=db(); connection.execute("DELETE FROM user_presence WHERE user_id=?",(uid,)); connection.close()
+    connection = db()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        m = connection.execute("SELECT v FROM settings WHERE k='mode'").fetchone()[0]
+        user = session_user(request, connection, m)
+        if user:
+            connection.execute("DELETE FROM user_presence WHERE user_id=?", (user["id"],))
+        connection.execute("COMMIT")
+    finally:
+        connection.close()
     request.session.clear(); return RedirectResponse("/",303)
 
 
@@ -296,11 +396,13 @@ def auction(request:Request):
 
 @app.post("/bid")
 async def bid(request:Request,amount:int=Form(...),auction_id:int=Form(0)):
-    uid=request.session.get("uid");touch_user(uid);connection=db()
+    uid=request.session.get("uid");connection=db()
     try:
-        connection.execute("BEGIN IMMEDIATE");user=connection.execute("SELECT * FROM users WHERE id=? AND mode=?",(uid,mode())).fetchone();active=connection.execute("SELECT * FROM auctions WHERE mode=? AND status='OPEN'",(mode(),)).fetchone();high=connection.execute("SELECT amount FROM bids WHERE auction_id=? ORDER BY amount DESC,stamp_ns,id LIMIT 1",(active["id"],)).fetchone() if active else None
+        connection.execute("BEGIN IMMEDIATE");m=connection.execute("SELECT v FROM settings WHERE k='mode'").fetchone()[0];user=session_user(request,connection,m);active=connection.execute("SELECT * FROM auctions WHERE mode=? AND status='OPEN'",(m,)).fetchone();high=connection.execute("SELECT amount FROM bids WHERE auction_id=? ORDER BY amount DESC,stamp_ns,id LIMIT 1",(active["id"],)).fetchone() if active else None
         if not user:raise ValueError("Sign in with your registered email again.")
         if not active:raise ValueError("Bidding is closed. Wait for the next prize.")
+        if active["ends_at"] is None or time.time() >= active["ends_at"]:
+            raise ValueError("Time is up. Bidding is closed.")
         if auction_id!=active["id"]:raise ValueError("The prize changed. Refresh and review the prize before bidding.")
         if amount<1:raise ValueError("Enter at least 1 point.")
         if amount>user["balance"]:raise ValueError("This bid exceeds your available balance.")
@@ -319,7 +421,7 @@ async def bid(request:Request,amount:int=Form(...),auction_id:int=Form(0)):
 
 @app.get("/catalog")
 def catalog(request:Request):
-    touch_user(request.session.get("uid"));connection=db();prizes=connection.execute("SELECT * FROM prizes WHERE mode=? ORDER BY name",(mode(),)).fetchall();connection.close();cards=[]
+    touch_user(request);connection=db();prizes=connection.execute("SELECT * FROM prizes WHERE mode=? ORDER BY name",(mode(),)).fetchall();connection.close();cards=[]
     for prize in prizes:
         image=f'<img class="prize" src="{e(prize["image_url"])}">' if prize["image_url"] else "";cards.append(f'<div class="card">{image}<h2>{e(prize["name"])}</h2><p>Quantity: {prize["quantity"]}</p></div>')
     script=participant_script(request.session.get("uid")) if request.session.get("uid") else ""
@@ -338,7 +440,7 @@ def admin(request:Request):
     m=mode();cutoff=time.time()-ONLINE_SECONDS;connection=db();users=connection.execute("SELECT * FROM users WHERE mode=? ORDER BY name",(m,)).fetchall();prizes=connection.execute("SELECT * FROM prizes WHERE mode=? AND quantity>0 ORDER BY name",(m,)).fetchall();bids=connection.execute("SELECT b.stamp,u.name,p.name prize,b.amount FROM bids b JOIN users u ON u.id=b.user_id JOIN auctions a ON a.id=b.auction_id JOIN prizes p ON p.id=a.prize_id WHERE a.mode=? ORDER BY b.id DESC LIMIT 50",(m,)).fetchall();winners=connection.execute("SELECT * FROM winners WHERE mode=? ORDER BY id DESC LIMIT 20",(m,)).fetchall();online=connection.execute("SELECT u.name,u.email,p.last_seen FROM user_presence p JOIN users u ON u.id=p.user_id WHERE p.mode=? AND p.last_seen>=? ORDER BY p.last_seen DESC",(m,cutoff)).fetchall();total_bids=connection.execute("SELECT COUNT(*) n FROM bids b JOIN auctions a ON a.id=b.auction_id WHERE a.mode=?",(m,)).fetchone()["n"];closed=connection.execute("SELECT COUNT(*) n FROM auctions WHERE mode=? AND status='CLOSED'",(m,)).fetchone()["n"];remaining=connection.execute("SELECT COALESCE(SUM(quantity),0) n FROM prizes WHERE mode=?",(m,)).fetchone()["n"];connection.close()
     options="".join(f'<option value="{p["id"]}">{e(p["name"])} ({p["quantity"]})</option>' for p in prizes);user_rows="".join(f'<tr><td>{e(u["name"])}</td><td>{e(u["email"])}</td><td><form method="post" action="/admin/user/update"><input type="hidden" name="user_id" value="{u["id"]}"><input type="number" name="balance" min="0" value="{u["balance"]}" style="width:100px"><button>Save</button></form></td></tr>' for u in users);bid_rows="".join(f'<tr><td>{e(x["stamp"])}</td><td>{e(x["name"])}</td><td>{e(x["prize"])}</td><td>{x["amount"]}</td></tr>' for x in bids);winner_rows="".join(f'<tr><td>{e(x["prize_name"])}</td><td>{e(x["winner_name"])}</td><td>{x["winning_bid"]}</td><td>{e(x["created_at"])}</td></tr>' for x in winners);online_rows="".join(f'<tr><td><span class="online-dot"></span>{e(x["name"])}</td><td>{e(x["email"])}</td><td>{relative_seen(x["last_seen"])}</td></tr>' for x in online)
     reset='<form method="post" action="/admin/reset-test" onsubmit="return confirm(\'Reset all TEST data?\')"><button class="danger">Reset TEST Mode</button></form>' if m=="test" else "";sound_label="Disable Sounds" if sounds_enabled() else "Enable Sounds"
-    body=f'''<h1>Admin: {m.upper()}</h1><div class="grid summary"><div class="card"><div>Connected</div><div class="metric">{len(online)}</div><small>of {len(users)}</small></div><div class="card"><div>Total Bids</div><div class="metric">{total_bids}</div></div><div class="card"><div>Auctions Closed</div><div class="metric">{closed}</div></div><div class="card"><div>Remaining Prizes</div><div class="metric">{remaining}</div></div></div><div class="card"><form method="post" action="/admin/mode"><button class="gold">Switch Test/Live</button></form>{reset}<form method="post" action="/admin/sounds"><button class="secondary">{sound_label}</button></form><form method="post" action="/admin/backup"><button class="secondary">Download Backup</button></form></div><div class="card"><h2>Connected Participants ({len(online)})</h2><table><tr><th>Name</th><th>Email</th><th>Last Activity</th></tr>{online_rows}</table></div><div class="card"><h2>Import Excel Workbook</h2><form method="post" action="/admin/import/preview" enctype="multipart/form-data"><input type="file" name="workbook" accept=".xlsx" required><select name="action"><option value="replace">Replace current mode data</option><option value="append">Append/update names; keep balances and stock</option></select><button>Preview Import</button></form><a href="/admin/export/users">Participants CSV</a> | <a href="/admin/export/results">Results CSV</a></div><div class="card"><h2>Auction Controls</h2><form method="post" action="/admin/open"><select name="prize_id" required>{options}</select><button class="green">Open</button></form><form method="post" action="/admin/close/preview"><button class="danger">Close and Award</button></form></div><div class="card"><h2>Participants and Balance Editing</h2><table><tr><th>Name</th><th>Email</th><th>Balance</th></tr>{user_rows}</table></div><div class="card"><h2>Bid History</h2><table><tr><th>UTC Time</th><th>Bidder</th><th>Prize</th><th>Amount</th></tr>{bid_rows}</table></div><div class="card"><h2>Winner History</h2><table><tr><th>Prize</th><th>Winner</th><th>Winning Bid</th><th>UTC Time</th></tr>{winner_rows}</table></div>'''
+    body=f'''<h1>Admin: {m.upper()}</h1><div class="grid summary"><div class="card"><div>Connected</div><div class="metric">{len(online)}</div><small>of {len(users)}</small></div><div class="card"><div>Total Bids</div><div class="metric">{total_bids}</div></div><div class="card"><div>Auctions Closed</div><div class="metric">{closed}</div></div><div class="card"><div>Remaining Prizes</div><div class="metric">{remaining}</div></div></div><div class="card"><form method="post" action="/admin/mode"><button class="gold">Switch Test/Live</button></form>{reset}<form method="post" action="/admin/sounds"><button class="secondary">{sound_label}</button></form><form method="post" action="/admin/backup"><button class="secondary">Download Backup</button></form></div><div class="card"><h2>Connected Participants ({len(online)})</h2><table><tr><th>Name</th><th>Email</th><th>Last Activity</th></tr>{online_rows}</table></div><div class="card"><h2>Import Excel Workbook</h2><form method="post" action="/admin/import/preview" enctype="multipart/form-data"><input type="file" name="workbook" accept=".xlsx" required><select name="action"><option value="replace">Replace current mode data</option><option value="append">Append/update names; keep balances and stock</option></select><button>Preview Import</button></form><a href="/admin/export/users">Participants CSV</a> | <a href="/admin/export/results">Results CSV</a></div>{auction_controls(options)}<div class="card"><h2>Participants and Balance Editing</h2><table><tr><th>Name</th><th>Email</th><th>Balance</th></tr>{user_rows}</table></div><div class="card"><h2>Bid History</h2><table><tr><th>UTC Time</th><th>Bidder</th><th>Prize</th><th>Amount</th></tr>{bid_rows}</table></div><div class="card"><h2>Winner History</h2><table><tr><th>Prize</th><th>Winner</th><th>Winning Bid</th><th>UTC Time</th></tr>{winner_rows}</table></div>'''
     return page(body+admin_script())
 
 
@@ -359,7 +461,8 @@ async def import_workbook(request:Request,workbook:UploadFile=File(...),action:s
         actual_mode=connection.execute("SELECT v FROM settings WHERE k='mode'").fetchone()[0]
         if actual_mode!=expected_mode or m!=expected_mode:raise ValueError("Mode changed. Preview the workbook again.")
         if action=="replace":
-            if connection.execute("SELECT 1 FROM auctions WHERE mode=? AND status='OPEN'",(m,)).fetchone():raise ValueError("Close the open auction before replacing data.")
+            invalidate_participants(connection, m)
+            if connection.execute("SELECT 1 FROM auctions WHERE mode=? AND status IN ('READY','OPEN')",(m,)).fetchone():raise ValueError("Close the open auction or cancel the loaded item before replacing data.")
             connection.execute("DELETE FROM bids WHERE auction_id IN (SELECT id FROM auctions WHERE mode=?)",(m,));connection.execute("DELETE FROM winners WHERE mode=?",(m,));connection.execute("DELETE FROM auctions WHERE mode=?",(m,));connection.execute("DELETE FROM otp WHERE mode=?",(m,));connection.execute("DELETE FROM user_presence WHERE mode=?",(m,));connection.execute("DELETE FROM users WHERE mode=?",(m,));connection.execute("DELETE FROM prizes WHERE mode=?",(m,))
         for name,email,points in users:connection.execute("INSERT INTO users(mode,name,email,balance) VALUES(?,?,?,?) ON CONFLICT(mode,email) DO UPDATE SET name=excluded.name",(m,name,email,points))
         for name,sku,image,quantity in prizes:
@@ -394,25 +497,103 @@ async def reset_test(request:Request):
     if not request.session.get("admin") or mode()!="test":return RedirectResponse("/admin",303)
     backup_db("before_test_reset");connection=db()
     try:
-        connection.execute("BEGIN IMMEDIATE");connection.execute("DELETE FROM bids WHERE auction_id IN (SELECT id FROM auctions WHERE mode='test')");connection.execute("DELETE FROM winners WHERE mode='test'");connection.execute("DELETE FROM auctions WHERE mode='test'");connection.execute("DELETE FROM otp WHERE mode='test'");connection.execute("DELETE FROM user_presence WHERE mode='test'");connection.execute("DELETE FROM users WHERE mode='test'");connection.execute("DELETE FROM prizes WHERE mode='test'");connection.execute("COMMIT")
-    except Exception:connection.execute("ROLLBACK")
-    connection.close();await hub.push();return RedirectResponse("/admin",303)
+        connection.execute("BEGIN IMMEDIATE")
+        if connection.execute("SELECT v FROM settings WHERE k='mode'").fetchone()[0] != "test":
+            raise ValueError("Mode changed. Return to TEST mode before resetting.")
+        invalidate_participants(connection, "test")
+        connection.execute("DELETE FROM bids WHERE auction_id IN (SELECT id FROM auctions WHERE mode='test')");connection.execute("DELETE FROM winners WHERE mode='test'");connection.execute("DELETE FROM auctions WHERE mode='test'");connection.execute("DELETE FROM otp WHERE mode='test'");connection.execute("DELETE FROM user_presence WHERE mode='test'");connection.execute("DELETE FROM users WHERE mode='test'");connection.execute("DELETE FROM prizes WHERE mode='test'");connection.execute("COMMIT")
+    except Exception as error:
+        connection.execute("ROLLBACK")
+        return page(f'<h2>Test reset failed</h2><p>{e(error)}</p><a href="/admin">Return</a>')
+    finally:connection.close()
+    await hub.push();return RedirectResponse("/admin",303)
 
 
 @app.post("/admin/open")
-async def open_auction(request:Request,prize_id:int=Form(...)):
-    if request.session.get("admin"):
-        connection=db()
-        try:
-            connection.execute("BEGIN IMMEDIATE");m=mode()
-            prize=connection.execute("SELECT 1 FROM prizes WHERE id=? AND mode=? AND quantity>0",(prize_id,m)).fetchone()
-            if not prize:raise ValueError("Choose an available prize in the current mode.")
-            if connection.execute("SELECT 1 FROM auctions WHERE mode=? AND status='OPEN'",(m,)).fetchone():raise ValueError("Close the current auction before opening another.")
-            connection.execute("INSERT INTO auctions(mode,prize_id,status,opened) VALUES(?,?,'OPEN',?)",(m,prize_id,datetime.now(timezone.utc).isoformat()));connection.execute("COMMIT")
-        except Exception as error:
-            connection.execute("ROLLBACK");return page(f'<div class="card"><h2>Could not open auction</h2><p>{e(error)}</p><a href="/admin">Return</a></div>')
-        finally:connection.close()
-        await hub.push()
+@app.post("/admin/load")
+async def load_auction(request:Request,prize_id:int=Form(...)):
+    if not request.session.get("admin"):
+        return RedirectResponse("/admin",303)
+    connection=db()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        m=connection.execute("SELECT v FROM settings WHERE k='mode'").fetchone()[0]
+        prize=connection.execute("SELECT 1 FROM prizes WHERE id=? AND mode=? AND quantity>0",(prize_id,m)).fetchone()
+        if not prize:raise ValueError("Choose an available prize in the current mode.")
+        if connection.execute("SELECT 1 FROM auctions WHERE mode=? AND status IN ('READY','OPEN')",(m,)).fetchone():
+            raise ValueError("Award or cancel the current item before loading another.")
+        connection.execute("INSERT INTO auctions(mode,prize_id,status) VALUES(?,?,'READY')",(m,prize_id))
+        connection.execute("COMMIT")
+    except Exception as error:
+        connection.execute("ROLLBACK")
+        return page(f'<h2>Could not load item</h2><p>{e(error)}</p><a href="/admin">Return</a>')
+    finally:connection.close()
+    await hub.push()
+    return RedirectResponse("/admin",303)
+
+
+@app.post("/admin/start")
+async def start_auction(request:Request,auction_id:int=Form(...)):
+    if not request.session.get("admin"):
+        return RedirectResponse("/admin",303)
+    connection=db()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        m=connection.execute("SELECT v FROM settings WHERE k='mode'").fetchone()[0]
+        active=connection.execute("SELECT * FROM auctions WHERE mode=? AND status IN ('READY','OPEN')",(m,)).fetchone()
+        if not active or active['id']!=auction_id:raise ValueError("The item changed. Review the loaded item before starting.")
+        if active['status']!='READY':raise ValueError("This auction has already started. Its timer cannot be restarted.")
+        now=time.time()
+        connection.execute("UPDATE auctions SET status='OPEN',opened=?,ends_at=? WHERE id=?",
+                           (datetime.fromtimestamp(now,timezone.utc).isoformat(),now+30,auction_id))
+        connection.execute("COMMIT")
+    except Exception as error:
+        connection.execute("ROLLBACK")
+        return page(f'<h2>Could not start auction</h2><p>{e(error)}</p><a href="/admin">Return</a>')
+    finally:connection.close()
+    await hub.push()
+    return RedirectResponse("/admin",303)
+
+
+@app.post("/admin/end")
+async def end_bidding_early(request:Request,auction_id:int=Form(...)):
+    if not request.session.get("admin"):
+        return RedirectResponse("/admin",303)
+    connection=db()
+    try:
+        # Serialize with bids so the cutoff and accepted bid history agree.
+        connection.execute("BEGIN IMMEDIATE")
+        m=connection.execute("SELECT v FROM settings WHERE k='mode'").fetchone()[0]
+        active=connection.execute("SELECT * FROM auctions WHERE mode=? AND status IN ('READY','OPEN')",(m,)).fetchone()
+        if not active or active['id']!=auction_id:
+            raise ValueError("The auction changed. Review the current item before ending bidding.")
+        if active['status']!='OPEN':
+            raise ValueError("Start the auction before ending bidding, or cancel the loaded item.")
+        now=time.time()
+        if active['ends_at'] is not None and active['ends_at']>now:
+            connection.execute("UPDATE auctions SET ends_at=? WHERE id=?",(now,auction_id))
+        connection.execute("COMMIT")
+    except Exception as error:
+        connection.execute("ROLLBACK")
+        return page(f'<h2>Could not end bidding</h2><p>{e(error)}</p><a href="/admin">Return</a>')
+    finally:connection.close()
+    await hub.push()
+    return RedirectResponse("/admin",303)
+
+
+@app.post("/admin/cancel")
+async def cancel_auction(request:Request,auction_id:int=Form(...)):
+    if not request.session.get("admin"):
+        return RedirectResponse("/admin",303)
+    connection=db()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        m=connection.execute("SELECT v FROM settings WHERE k='mode'").fetchone()[0]
+        connection.execute("UPDATE auctions SET status='CANCELLED',closed=? WHERE id=? AND mode=? AND status IN ('READY','OPEN')",
+                           (datetime.now(timezone.utc).isoformat(),auction_id,m))
+        connection.execute("COMMIT")
+    finally:connection.close()
+    await hub.push()
     return RedirectResponse("/admin",303)
 
 
@@ -423,6 +604,8 @@ async def close_auction(request:Request,auction_id:int=Form(0),bid_id:int=Form(-
         try:
             connection.execute("BEGIN IMMEDIATE");active=connection.execute("SELECT * FROM auctions WHERE mode=? AND status='OPEN'",(m,)).fetchone()
             if active:
+                if active['ends_at'] is not None and time.time() < active['ends_at']:
+                    raise ValueError("Wait until the timer ends or use End Bidding Early before awarding the prize.")
                 if auction_id!=active["id"]:raise ValueError("The auction changed. Review the award again.")
                 winning=connection.execute("SELECT * FROM bids WHERE auction_id=? ORDER BY amount DESC,stamp_ns,id LIMIT 1",(active["id"],)).fetchone();closed=datetime.now(timezone.utc).isoformat()
                 if bid_id!=(winning["id"] if winning else 0):raise ValueError("A new bid arrived. Review the latest winner before confirming.")
@@ -450,8 +633,10 @@ async def switch_mode(request:Request):
         connection=db()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            if connection.execute("SELECT 1 FROM auctions WHERE status='OPEN'").fetchone():raise ValueError("Close the open auction before switching modes.")
+            if connection.execute("SELECT 1 FROM auctions WHERE status IN ('READY','OPEN')").fetchone():raise ValueError("Award or cancel the current item before switching modes.")
             old=connection.execute("SELECT v FROM settings WHERE k='mode'").fetchone()[0]
+            invalidate_participants(connection, "test")
+            invalidate_participants(connection, "live")
             connection.execute("UPDATE settings SET v=? WHERE k='mode'",("live" if old=="test" else "test",));connection.execute("COMMIT")
         except Exception as error:
             connection.execute("ROLLBACK");return page(f'<div class="card"><h2>Could not switch mode</h2><p>{e(error)}</p><a href="/admin">Return</a></div>')
@@ -508,20 +693,20 @@ def display_state():
             row=connection.execute("SELECT prize_name,winner_name,winning_bid FROM winners WHERE auction_id=?",(active["id"],)).fetchone()
             winner=dict(row) if row else None
         finally:connection.close()
-    return JSONResponse({"auction":dict(active) if active else None,"winner":winner,"sounds":sounds_enabled()},headers={"Cache-Control":"no-store"})
+    return JSONResponse({"auction":auction_payload(active),"server_now":time.time(),"winner":winner,"sounds":sounds_enabled()},headers={"Cache-Control":"no-store"})
 
 
 def display_page():
-    return page('''<div id="screen" class="display"><div id="trophy" class="trophy" hidden>🏆 WINNER 🏆</div><img id="image" class="prize" hidden><h2 id="status">Auction will begin soon</h2><h1 id="prize"></h1><p id="label"></p><div id="points" class="big"></div><div id="leader" class="leader"></div><small id="connection" role="status">Connecting...</small><button id="audio" class="secondary">Enable sounds</button></div><canvas id="confetti"></canvas>
+    return page('''<div id="screen" class="display"><div id="trophy" class="trophy" hidden>🏆 WINNER 🏆</div><img id="image" class="prize" hidden><h2 id="status">Auction will begin soon</h2><div id="countdown" class="leader" role="timer"></div><h1 id="prize"></h1><p id="label"></p><div id="points" class="big"></div><div id="leader" class="leader"></div><small id="connection" role="status">Connecting...</small><button id="audio" class="secondary">Enable sounds</button></div><canvas id="confetti"></canvas>
     <script>
     const el=id=>document.getElementById(id);let previous=null,audio=null,soundOn=false,socket,retry,refreshing=false,pending=false,animation;
     el('audio').onclick=async()=>{try{audio=audio||new(window.AudioContext||window.webkitAudioContext)();await audio.resume();el('audio').hidden=true}catch(e){el('audio').textContent='Sounds unavailable'}};
     function tone(freq,duration){if(!soundOn||!audio||audio.state!=='running')return;const o=audio.createOscillator(),g=audio.createGain();o.frequency.value=freq;o.connect(g);g.connect(audio.destination);g.gain.setValueAtTime(.18,audio.currentTime);g.gain.exponentialRampToValueAtTime(.001,audio.currentTime+duration);o.start();o.stop(audio.currentTime+duration)}
     function confetti(){cancelAnimationFrame(animation);const c=el('confetti'),x=c.getContext('2d');c.width=innerWidth;c.height=innerHeight;let n=0,p=Array.from({length:180},()=>({x:Math.random()*c.width,y:-Math.random()*c.height,vx:(Math.random()-.5)*5,vy:2+Math.random()*5,h:Math.random()*360}));function frame(){x.clearRect(0,0,c.width,c.height);p.forEach(q=>{q.x+=q.vx;q.y+=q.vy;q.vy+=.03;x.fillStyle=`hsl(${q.h} 85% 55%)`;x.fillRect(q.x,q.y,6,6)});if(n++<240)animation=requestAnimationFrame(frame);else x.clearRect(0,0,c.width,c.height)}frame()}
-    function render(s){const a=s.auction,w=s.winner,key=a?String(a.id):'none',won=!!(a&&a.status==='CLOSED'&&w);soundOn=s.sounds;
+    function render(s){const a=s.auction,w=s.winner,key=a?String(a.id):'none',won=!!(a&&a.status==='CLOSED'&&w);soundOn=s.sounds;updateAuctionClock(s);
       el('screen').classList.toggle('winner',won);el('trophy').hidden=!won;
-      el('status').textContent=!a?'Auction will begin soon':won?'Auction closed':a.status==='OPEN'?'Bidding open':'Auction closed - no bids';
-      el('status').className=a&&a.status==='OPEN'?'open':'closed';el('prize').textContent=w?.prize_name||a?.prize||'';
+      el('status').textContent=won?'Auction closed':auctionStatus(a);
+      el('status').className=auctionIsOpen(a)?'open':'closed';el('prize').textContent=w?.prize_name||a?.prize||'';
       el('label').textContent=a?(won?'Winning bid':'Highest bid'):'';el('points').textContent=a?String(won?w.winning_bid:(a.high||0))+' points':'';
       el('leader').textContent=w?.winner_name||a?.leader||(a?'No bids yet':'');el('image').hidden=true;
       if(a?.image_url){try{const u=new URL(a.image_url,location.href);if(['http:','https:'].includes(u.protocol)){el('image').src=u.href;el('image').hidden=false}}catch(e){}}
@@ -530,23 +715,25 @@ def display_page():
       if(previous&&previous.key!==key&&!won){cancelAnimationFrame(animation);el('confetti').getContext('2d').clearRect(0,0,innerWidth,innerHeight)}
       previous={key,won,bid:a?.high_bid_id||0};
     }
-    async function refresh(){if(refreshing){pending=true;return}refreshing=true;try{const r=await fetch('/api/display',{cache:'no-store'});if(!r.ok)throw Error();render(await r.json())}catch(e){el('connection').textContent='Connection interrupted - retrying'}finally{refreshing=false;if(pending){pending=false;refresh()}}}
+    async function refresh(){if(refreshing){pending=true;return}refreshing=true;try{const r=await fetch('/api/display',{cache:'no-store'});if(!r.ok)throw Error();const data=await r.json();updateAuctionClock(data);render(data)}catch(e){el('connection').textContent='Connection interrupted - retrying'}finally{refreshing=false;if(pending){pending=false;refresh()}}}
     function connect(){clearTimeout(retry);socket=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws');socket.onopen=()=>{el('connection').textContent='Connected';refresh()};socket.onmessage=refresh;socket.onclose=()=>{el('connection').textContent='Reconnecting...';retry=setTimeout(connect,3000)};socket.onerror=()=>socket.close()}
     function resume(){refresh();if(!socket||socket.readyState===WebSocket.CLOSED)connect()}
-    window.addEventListener('online',resume);document.addEventListener('visibilitychange',()=>{if(!document.hidden)resume()});refresh();connect();setInterval(()=>{if(!document.hidden)refresh()},15000);
+    window.addEventListener('online',resume);document.addEventListener('visibilitychange',()=>{if(!document.hidden)resume()});refresh();connect();setInterval(()=>{if(!document.hidden)refresh()},1000);
     </script>''')
 
 
 def participant_state(request):
-    uid=request.session.get("uid");connection=db();m=mode()
+    uid=request.session.get("uid");connection=db()
     try:
-        user=connection.execute("SELECT * FROM users WHERE id=? AND mode=?",(uid,m)).fetchone()
+        connection.execute("BEGIN")
+        m=connection.execute("SELECT v FROM settings WHERE k='mode'").fetchone()[0]
+        user=session_user(request,connection,m)
         if not user:return None
-        active=current();a=dict(active) if active else None
+        active=current(connection,m);a=auction_payload(active)
         personal=connection.execute("SELECT MAX(amount) FROM bids WHERE user_id=? AND auction_id=?",(uid,a["id"])).fetchone()[0] if a else None
         leading=connection.execute("SELECT user_id FROM bids WHERE id=?",(a["high_bid_id"],)).fetchone() if a and a["high_bid_id"] else None
         wins=[dict(x) for x in connection.execute("SELECT w.prize_name,w.winning_bid FROM winners w JOIN auctions a ON a.id=w.auction_id WHERE a.winner=? AND w.mode=? ORDER BY w.id DESC",(uid,m))]
-        return {"name":user["name"],"balance":user["balance"],"auction":a,"last_bid":personal,"leading":bool(leading and leading[0]==uid),"wins":wins}
+        return {"server_now":time.time(),"name":user["name"],"balance":user["balance"],"auction":a,"last_bid":personal,"leading":bool(leading and leading[0]==uid),"wins":wins}
     finally:connection.close()
 
 
@@ -559,14 +746,14 @@ def auction_state(request:Request):
 def participant_page(request):
     if not participant_state(request):return RedirectResponse("/",303)
     return page('''<div class="grid"><div class="card"><h2 id="rep-name"></h2><p>Remaining balance</p><div class="big" id="balance"></div><p id="connection" role="status">Connecting...</p><a href="/logout">Log out</a><h3>Your prizes</h3><p id="spent"></p><ul id="wins"></ul></div>
-    <div class="card"><img id="prize-image" class="prize" hidden><h3 id="auction-status"></h3><h1 id="prize-name"></h1><p>Highest bid</p><div class="big" id="high"></div><div class="leader" id="leader"></div><p id="personal" role="status"></p>
+    <div class="card"><img id="prize-image" class="prize" hidden><h3 id="auction-status"></h3><div id="countdown" class="leader" role="timer"></div><h1 id="prize-name"></h1><p>Highest bid</p><div class="big" id="high"></div><div class="leader" id="leader"></div><p id="personal" role="status"></p>
     <form id="bid-form"><label for="amount">Your bid in points</label><input type="number" id="amount" min="1" required inputmode="numeric"><button id="submit">Submit Bid</button><button type="button" id="next">Bid 1 point more</button></form><p id="feedback" role="status" aria-live="polite"></p></div></div>
     <script>
     const el=id=>document.getElementById(id);let state,busy=false,socket,retry,refreshing=false,pending=false;
-    function render(s){const a=s.auction,open=a&&a.status==='OPEN',changed=state&&((state.auction?.id||0)!==(a?.id||0));
+    function render(s){const a=s.auction,open=auctionIsOpen(a),changed=state&&((state.auction?.id||0)!==(a?.id||0));
       if(changed){el('amount').value='';el('feedback').textContent='The prize changed. Review it before bidding.'}
       state=s;el('rep-name').textContent=s.name;el('balance').textContent=s.balance;
-      el('auction-status').textContent=open?'Bidding open':a?'Auction closed - waiting for the next prize':'Waiting for the next prize';
+      el('auction-status').textContent=auctionStatus(a);
       el('prize-name').textContent=a?.prize||'';el('high').textContent=a?.high||0;el('leader').textContent=a?.leader||'No bids yet';
       el('personal').textContent=s.last_bid?(open?(s.leading?'You are leading':'You have been outbid'):'Your last bid')+' - '+s.last_bid+' points':'You have not bid on this prize yet.';
       el('amount').max=s.balance;const minimum=(a?.high||0)+1;el('amount').min=minimum;
@@ -575,14 +762,14 @@ def participant_page(request):
       el('wins').replaceChildren();for(const w of s.wins){const li=document.createElement('li');li.textContent=w.prize_name+' - '+w.winning_bid+' points';el('wins').append(li)}
       el('spent').textContent=s.wins.length?'Points spent: '+s.wins.reduce((n,w)=>n+w.winning_bid,0):'No prizes won yet.';
     }
-    async function refresh(){if(refreshing){pending=true;return}refreshing=true;try{const r=await fetch('/api/auction',{cache:'no-store'});if(r.status===401){location.href='/';return}if(!r.ok)throw Error();render(await r.json())}catch(e){el('connection').textContent='Connection interrupted - retrying'}finally{refreshing=false;if(pending){pending=false;refresh()}}}
+    async function refresh(){if(refreshing){pending=true;return}refreshing=true;try{const r=await fetch('/api/auction',{cache:'no-store'});if(r.status===401){location.href='/';return}if(!r.ok)throw Error();const data=await r.json();updateAuctionClock(data);render(data)}catch(e){el('connection').textContent='Connection interrupted - retrying'}finally{refreshing=false;if(pending){pending=false;refresh()}}}
     function connect(){clearTimeout(retry);socket=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws');socket.onopen=()=>{el('connection').textContent='Connected';refresh()};socket.onmessage=refresh;socket.onclose=()=>{el('connection').textContent='Reconnecting...';retry=setTimeout(connect,3000)};socket.onerror=()=>socket.close()}
-    async function submit(amount){if(busy||!state?.auction||state.auction.status!=='OPEN')return;const auction=state.auction.id;busy=true;render(state);el('feedback').textContent='Submitting...';try{const data=new URLSearchParams({amount,auction_id:auction});const r=await fetch('/bid',{method:'POST',headers:{Accept:'application/json'},body:data});const result=await r.json();el('feedback').textContent=result.message}catch(e){el('feedback').textContent='Could not confirm submission. Check your last bid before retrying.'}finally{busy=false;await refresh();if(state)render(state)}}
+    async function submit(amount){if(busy||!auctionIsOpen(state?.auction))return;const auction=state.auction.id;busy=true;render(state);el('feedback').textContent='Submitting...';try{const data=new URLSearchParams({amount,auction_id:auction});const r=await fetch('/bid',{method:'POST',headers:{Accept:'application/json'},body:data});const result=await r.json();el('feedback').textContent=result.message}catch(e){el('feedback').textContent='Could not confirm submission. Check your last bid before retrying.'}finally{busy=false;await refresh();if(state)render(state)}}
     el('bid-form').onsubmit=e=>{e.preventDefault();const amount=el('amount').value;if(confirm('Submit '+amount+' points for '+state.auction.prize+'?'))submit(amount)};
     el('next').onclick=()=>{const amount=(state.auction.high||0)+1;if(confirm('Submit '+amount+' points for '+state.auction.prize+'?'))submit(amount)};
     function heartbeat(){fetch('/heartbeat',{method:'POST'}).catch(()=>{})}
     window.addEventListener('online',()=>{refresh();if(!socket||socket.readyState===WebSocket.CLOSED)connect()});document.addEventListener('visibilitychange',()=>{if(!document.hidden){refresh();heartbeat();if(!socket||socket.readyState===WebSocket.CLOSED)connect()}});
-    refresh();connect();heartbeat();setInterval(heartbeat,10000);setInterval(()=>{if(!document.hidden)refresh()},15000);
+    refresh();connect();heartbeat();setInterval(heartbeat,10000);setInterval(()=>{if(!document.hidden)refresh()},1000);
     </script>''')
 
 
@@ -591,6 +778,8 @@ def preview_award(request:Request):
     if not request.session.get("admin"):return RedirectResponse("/admin",303)
     a=current()
     if not a or a["status"]!="OPEN":return page('<h2>No open auction</h2><a href="/admin">Return</a>')
+    if a['ends_at'] is not None and time.time() < a['ends_at']:
+        return page('<h2>Bidding is still open</h2><p>Wait until the timer ends or use End Bidding Early to review the award.</p><a href="/admin">Return</a>')
     summary=f'Winner: {e(a["leader"])}<br>Winning bid: {a["high"]} points' if a["high_bid_id"] else 'No bids - close without awarding a prize.'
     return page(f'<div class="card"><h1>Confirm Award</h1><h2>{e(a["prize"])}</h2><p>{summary}</p><p>A new bid arriving before confirmation requires another review.</p><form method="post" action="/admin/close"><input type="hidden" name="auction_id" value="{a["id"]}"><input type="hidden" name="bid_id" value="{a["high_bid_id"] or 0}"><button class="danger">Confirm Close and Award</button></form><a href="/admin">Cancel</a></div>')
 
