@@ -1,4 +1,6 @@
 import csv, html, io, os, secrets, shutil, sqlite3, time, json
+import base64, hashlib, re
+from urllib.parse import urlsplit
 from datetime import datetime, timezone
 from pathlib import Path
 from dotenv import load_dotenv
@@ -222,6 +224,7 @@ def auction_payload(row, now=None):
     if not row:
         return None
     result = dict(row)
+    result['image_url'] = normalize_image_url(result.get('image_url'))
     now = time.time() if now is None else now
     if result['status'] == 'OPEN' and (result['ends_at'] is None or now >= result['ends_at']):
         result['status'] = 'ENDED'
@@ -306,6 +309,41 @@ def display_script(auction_id, high_bid_id, winner=False):
     </script>'''
 
 
+def normalize_image_url(value):
+    """Accept browser image sources without restricting hosts or file extensions."""
+    value = str(value or '').strip()
+    if value.startswith('//'):
+        value = 'https:' + value
+    if value.lower().startswith('www.'):
+        value = 'https://' + value
+    if re.match(r'^data:image/(?:png|jpeg|jpg|gif|webp|avif|bmp|x-icon);base64,', value, re.I):
+        try:
+            header, encoded = value.split(',', 1)
+            encoded = re.sub(r'\s+', '', encoded)
+            if not encoded or len(encoded) > 4_000_000:
+                return ''
+            base64.b64decode(encoded, validate=True)
+            return header.lower() + ',' + encoded
+        except ValueError:
+            return ''
+    try:
+        parsed = urlsplit(value)
+        if parsed.scheme.lower() in ('http', 'https') and parsed.hostname and not parsed.username and not parsed.password:
+            return value
+    except ValueError:
+        pass
+    return ''
+
+
+def image_cell_source(cell):
+    if cell.hyperlink and cell.hyperlink.target:
+        return cell.hyperlink.target
+    value = str(cell.value or '').strip()
+    # Read literal links in Excel formulas without executing workbook formulas.
+    match = re.match(r'^=\s*(?:_xlfn\.)?(?:HYPERLINK|IMAGE)\s*\(\s*"((?:[^"]|"")*)"', value, re.I)
+    return match.group(1).replace('""', '"') if match else value
+
+
 def parse_xlsx(data):
     workbook = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     warnings, users, prizes = [], [], []
@@ -327,6 +365,8 @@ def parse_xlsx(data):
         if email in seen: warnings.append(f"Duplicate email skipped: {email}"); continue
         seen.add(email); users.append((name,email,points))
     if "Auction Prize List" in workbook.sheetnames:
+        source_book = load_workbook(io.BytesIO(data), read_only=False, data_only=False)
+        source_sheet = source_book['Auction Prize List']
         sheet=workbook["Auction Prize List"]; rows=list(sheet.iter_rows(values_only=True)); header=None
         for index,row in enumerate(rows[:20]):
             values=[str(value or "").strip().lower() for value in row]
@@ -335,11 +375,20 @@ def parse_xlsx(data):
         if header is None: warnings.append("Prize sheet headers not recognized.")
         else:
             grouped={}
-            for row in rows[header+1:]:
+            for row_number,row in enumerate(rows[header+1:],header+2):
                 name=str(row[name_col] or "").strip() if len(row)>name_col else ""; sku=str(row[sku_col] or "").strip() if len(row)>sku_col else ""
-                if not name or not sku: continue
-                image=str(row[image_col] or "").strip() if image_col is not None and len(row)>image_col else ""; key=sku.lower(); grouped.setdefault(key,[name,sku,image,0]); grouped[key][3]+=1
+                if not name: continue
+                if not sku:
+                    sku = 'AUTO-' + hashlib.sha256(name.casefold().encode()).hexdigest()[:20]
+                raw_image = image_cell_source(source_sheet.cell(row_number,image_col+1)) if image_col is not None else ''
+                image = normalize_image_url(raw_image)
+                if raw_image and not image:
+                    warnings.append(f'Prize row {row_number}: use a public HTTP(S) image URL or a base64 image link.')
+                key=sku.lower(); grouped.setdefault(key,[name,sku,image,0]); grouped[key][3]+=1
+                if image and not grouped[key][2]: grouped[key][2]=image
             prizes=list(grouped.values())
+        source_book.close()
+    workbook.close()
     return users,prizes,warnings
 
 
@@ -423,7 +472,9 @@ async def bid(request:Request,amount:int=Form(...),auction_id:int=Form(0)):
 def catalog(request:Request):
     touch_user(request);connection=db();prizes=connection.execute("SELECT * FROM prizes WHERE mode=? ORDER BY name",(mode(),)).fetchall();connection.close();cards=[]
     for prize in prizes:
-        image=f'<img class="prize" src="{e(prize["image_url"])}">' if prize["image_url"] else "";cards.append(f'<div class="card">{image}<h2>{e(prize["name"])}</h2><p>Quantity: {prize["quantity"]}</p></div>')
+        source=normalize_image_url(prize['image_url'])
+        image=f'<img class="prize" src="{e(source)}" alt="{e(prize["name"])}" loading="lazy" referrerpolicy="no-referrer" onerror="this.hidden=true;this.nextElementSibling.hidden=false"><p hidden>Image unavailable. Use a direct public image link.</p>' if source else ''
+        cards.append(f'<div class="card">{image}<h2>{e(prize["name"])}</h2><p>Quantity: {prize["quantity"]}</p></div>')
     script=participant_script(request.session.get("uid")) if request.session.get("uid") else ""
     return page('<h1>Prize Catalog</h1><div class="grid">'+"".join(cards)+"</div>"+script)
 
@@ -709,7 +760,7 @@ def display_page():
       el('status').className=auctionIsOpen(a)?'open':'closed';el('prize').textContent=w?.prize_name||a?.prize||'';
       el('label').textContent=a?(won?'Winning bid':'Highest bid'):'';el('points').textContent=a?String(won?w.winning_bid:(a.high||0))+' points':'';
       el('leader').textContent=w?.winner_name||a?.leader||(a?'No bids yet':'');el('image').hidden=true;
-      if(a?.image_url){try{const u=new URL(a.image_url,location.href);if(['http:','https:'].includes(u.protocol)){el('image').src=u.href;el('image').hidden=false}}catch(e){}}
+      if(a?.image_url){const image=el('image');image.referrerPolicy='no-referrer';image.onerror=()=>{image.hidden=true};if(image.getAttribute('src')!==a.image_url)image.src=a.image_url;image.hidden=false}
       if(won&&(!previous||previous.key!==key||!previous.won)){confetti();tone(523,.25);setTimeout(()=>tone(659,.25),250);setTimeout(()=>tone(784,.45),500)}
       else if(a&&previous&&previous.key===key&&(a.high_bid_id||0)>previous.bid&&!won){el('points').classList.remove('bid-flash');void el('points').offsetWidth;el('points').classList.add('bid-flash');tone(880,.18)}
       if(previous&&previous.key!==key&&!won){cancelAnimationFrame(animation);el('confetti').getContext('2d').clearRect(0,0,innerWidth,innerHeight)}
@@ -758,7 +809,7 @@ def participant_page(request):
       el('personal').textContent=s.last_bid?(open?(s.leading?'You are leading':'You have been outbid'):'Your last bid')+' - '+s.last_bid+' points':'You have not bid on this prize yet.';
       el('amount').max=s.balance;const minimum=(a?.high||0)+1;el('amount').min=minimum;
       el('submit').disabled=busy||!open;el('amount').disabled=busy||!open;el('next').disabled=busy||!open||minimum>s.balance;el('next').textContent='Bid '+minimum+' points';
-      const image=el('prize-image');image.hidden=true;if(a?.image_url){try{const u=new URL(a.image_url,location.href);if(['http:','https:'].includes(u.protocol)){image.src=u.href;image.hidden=false}}catch(e){}}
+      const image=el('prize-image');image.hidden=true;if(a?.image_url){image.referrerPolicy='no-referrer';image.onerror=()=>{image.hidden=true};if(image.getAttribute('src')!==a.image_url)image.src=a.image_url;image.hidden=false}
       el('wins').replaceChildren();for(const w of s.wins){const li=document.createElement('li');li.textContent=w.prize_name+' - '+w.winning_bid+' points';el('wins').append(li)}
       el('spent').textContent=s.wins.length?'Points spent: '+s.wins.reduce((n,w)=>n+w.winning_bid,0):'No prizes won yet.';
     }
