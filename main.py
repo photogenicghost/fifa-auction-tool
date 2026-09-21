@@ -1,7 +1,8 @@
-import csv, html, io, os, secrets, shutil, sqlite3, time, json
+import asyncio, csv, html, io, os, secrets, shutil, sqlite3, time, json
 import base64, hashlib, re
 from urllib.parse import urlsplit
 from datetime import datetime, timezone
+from contextlib import asynccontextmanager
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -9,6 +10,7 @@ from fastapi import FastAPI, File, Form, Request, UploadFile, WebSocket, WebSock
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse, FileResponse
 from openpyxl import load_workbook
 from starlette.middleware.sessions import SessionMiddleware
+from starlette.concurrency import run_in_threadpool
 
 BASE = Path(__file__).resolve().parent
 load_dotenv(BASE / ".env")
@@ -21,7 +23,18 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB = DATA_DIR / "auction.db"
 BACKUP_DIR = DATA_DIR / "backups"
 BACKUP_DIR.mkdir(exist_ok=True)
-app = FastAPI(title="FIFA Auction Tool")
+@asynccontextmanager
+async def lifespan(application):
+    # Keep the WAL open between requests; don't hold a read transaction.
+    anchor = db()
+    anchor.execute('SELECT 1 FROM settings').fetchone()
+    try:
+        yield
+    finally:
+        anchor.close()
+
+
+app = FastAPI(title="FIFA Auction Tool", lifespan=lifespan)
 app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET, same_site="lax", https_only=os.getenv("COOKIE_SECURE", "false").lower() == "true")
 ONLINE_SECONDS = 35
 
@@ -29,12 +42,12 @@ ONLINE_SECONDS = 35
 def db():
     connection = sqlite3.connect(DB, timeout=10, isolation_level=None)
     connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA journal_mode=WAL")
     return connection
 
 
 def init():
     connection = db()
+    connection.execute("PRAGMA journal_mode=WAL")
     connection.executescript("""
     CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY,v TEXT);
     INSERT OR IGNORE INTO settings VALUES('mode','test');
@@ -51,6 +64,8 @@ def init():
     if "ends_at" not in {row[1] for row in connection.execute("PRAGMA table_info(auctions)")}:
         connection.execute("ALTER TABLE auctions ADD COLUMN ends_at REAL")
     connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_pending_auction ON auctions(mode) WHERE status IN ('READY','OPEN')")
+    connection.execute("CREATE INDEX IF NOT EXISTS bid_ranking ON bids(auction_id,amount DESC,stamp_ns,id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS participant_bids ON bids(user_id,auction_id,amount DESC)")
     for roster_mode in ("test", "live"):
         connection.execute("INSERT OR IGNORE INTO settings(k,v) VALUES(?,?)",
                            ("session_generation_" + roster_mode, secrets.token_hex(32)))
@@ -233,21 +248,35 @@ def auction_payload(row, now=None):
 
 class Hub:
     def __init__(self):
-        self.clients = []
+        self.clients = {}
 
     async def add(self, websocket):
         await websocket.accept()
-        self.clients.append(websocket)
+        changed = asyncio.Event()
+        self.clients[websocket] = changed
+        return changed
+
+    def remove(self, websocket):
+        self.clients.pop(websocket, None)
+
+    async def send_updates(self, websocket, changed):
+        while True:
+            await changed.wait()
+            # One refresh covers a burst of bids. Never queue an unbounded backlog.
+            await asyncio.sleep(.25)
+            changed.clear()
+            await asyncio.wait_for(websocket.send_text("update"), timeout=2)
 
     async def push(self):
-        for websocket in self.clients[:]:
-            try:
-                await websocket.send_text("update")
-            except Exception:
-                self.clients.remove(websocket)
+        # Mutations are already committed: slow/disconnected clients must not
+        # delay their response or turn a successful bid/award into an HTTP error.
+        for changed in tuple(self.clients.values()):
+            changed.set()
 
 
 hub = Hub()
+pending_bids = []
+bid_task = None
 
 
 @app.get("/healthz")
@@ -443,27 +472,75 @@ def auction(request:Request):
 
 
 
+def commit_bids(entries):
+    """Validate in arrival order and acknowledge only after a durable commit."""
+    connection = db()
+    results = []
+    try:
+        connection.execute('BEGIN IMMEDIATE')
+        m = connection.execute("SELECT v FROM settings WHERE k='mode'").fetchone()[0]
+        active = connection.execute("SELECT * FROM auctions WHERE mode=? AND status='OPEN'", (m,)).fetchone()
+        row = connection.execute('SELECT amount FROM bids WHERE auction_id=? ORDER BY amount DESC,stamp_ns,id LIMIT 1',
+                                 (active['id'],)).fetchone() if active else None
+        high = row['amount'] if row else 0
+        for request, amount, auction_id in entries:
+            try:
+                user = session_user(request, connection, m)
+                if not user:raise ValueError('Sign in with your registered email again.')
+                if not active:raise ValueError('Bidding is closed. Wait for the next prize.')
+                if active['ends_at'] is None or time.time() >= active['ends_at']:
+                    raise ValueError('Time is up. Bidding is closed.')
+                if auction_id != active['id']:raise ValueError('The prize changed. Refresh and review the prize before bidding.')
+                if amount < 1:raise ValueError('Enter at least 1 point.')
+                if amount > user['balance']:raise ValueError('This bid exceeds your available balance.')
+                if amount <= high:raise ValueError(f'Another bid arrived first. Bid at least {high+1} points.')
+                connection.execute('INSERT INTO bids(auction_id,user_id,amount,stamp,stamp_ns) VALUES(?,?,?,?,?)',
+                    (active['id'], user['id'], amount, datetime.now(timezone.utc).isoformat(), time.time_ns()))
+                high = amount
+                results.append(None)
+            except ValueError as error:
+                results.append(str(error))
+        connection.execute('COMMIT')
+        return results
+    except Exception:
+        if connection.in_transaction:
+            connection.execute('ROLLBACK')
+        # No accepted response may escape a transaction that failed to commit.
+        return ['Bid could not be submitted. Please try again.'] * len(entries)
+    finally:
+        connection.close()
+
+
+async def drain_bids():
+    while pending_bids:
+        # Group a simultaneous burst into one durable write, without sorting
+        # by price or acknowledging any request before the transaction commits.
+        await asyncio.sleep(.005)
+        batch = pending_bids[:100]
+        del pending_bids[:len(batch)]
+        try:
+            results = await run_in_threadpool(commit_bids, [entry for entry, future in batch])
+        except Exception:
+            results = ['Bid could not be submitted. Please try again.'] * len(batch)
+        if any(result is None for result in results):
+            await hub.push()
+        for (entry, future), result in zip(batch, results):
+            if not future.done():
+                future.set_result(result)
+
+
 @app.post("/bid")
 async def bid(request:Request,amount:int=Form(...),auction_id:int=Form(0)):
-    uid=request.session.get("uid");connection=db()
-    try:
-        connection.execute("BEGIN IMMEDIATE");m=connection.execute("SELECT v FROM settings WHERE k='mode'").fetchone()[0];user=session_user(request,connection,m);active=connection.execute("SELECT * FROM auctions WHERE mode=? AND status='OPEN'",(m,)).fetchone();high=connection.execute("SELECT amount FROM bids WHERE auction_id=? ORDER BY amount DESC,stamp_ns,id LIMIT 1",(active["id"],)).fetchone() if active else None
-        if not user:raise ValueError("Sign in with your registered email again.")
-        if not active:raise ValueError("Bidding is closed. Wait for the next prize.")
-        if active["ends_at"] is None or time.time() >= active["ends_at"]:
-            raise ValueError("Time is up. Bidding is closed.")
-        if auction_id!=active["id"]:raise ValueError("The prize changed. Refresh and review the prize before bidding.")
-        if amount<1:raise ValueError("Enter at least 1 point.")
-        if amount>user["balance"]:raise ValueError("This bid exceeds your available balance.")
-        if high and amount<=high["amount"]:raise ValueError(f"Another bid arrived first. Bid at least {high['amount']+1} points.")
-        connection.execute("INSERT INTO bids(auction_id,user_id,amount,stamp,stamp_ns) VALUES(?,?,?,?,?)",(active["id"],uid,amount,datetime.now(timezone.utc).isoformat(),time.time_ns()));connection.execute("COMMIT")
-    except Exception as error:
-        try:connection.execute("ROLLBACK")
-        except Exception:pass
-        connection.close()
-        if request.headers.get("accept")=="application/json":return JSONResponse({"ok":False,"message":str(error) if isinstance(error,ValueError) else "Bid could not be submitted. Please try again."},status_code=400)
-        return page('<div class="card"><h2>Bid rejected</h2><p>Check the auction status, current high bid, and available balance.</p><a href="/auction">Return</a></div>')
-    connection.close();await hub.push()
+    global bid_task
+    future = asyncio.get_running_loop().create_future()
+    pending_bids.append(((request, amount, auction_id), future))
+    if bid_task is None or bid_task.done():
+        bid_task = asyncio.create_task(drain_bids())
+    rejected = await future
+    if rejected is not None:
+        if request.headers.get('accept') == 'application/json':
+            return JSONResponse({'ok':False, 'message':rejected}, status_code=400)
+        return page('<div class="card"><h2>Bid rejected</h2><p>'+e(rejected)+'</p><a href="/auction">Return</a></div>')
     if request.headers.get("accept")=="application/json":return JSONResponse({"ok":True,"message":"Bid accepted."})
     return RedirectResponse("/auction",303)
 
@@ -728,11 +805,23 @@ def export_results(request:Request):
 
 @app.websocket("/ws")
 async def websocket(websocket:WebSocket):
-    await hub.add(websocket)
+    changed = await hub.add(websocket)
+    async def receive():
+        while True:
+            await websocket.receive_text()
+    tasks = [asyncio.create_task(receive()),
+             asyncio.create_task(hub.send_updates(websocket, changed))]
     try:
-        while True:await websocket.receive_text()
-    except WebSocketDisconnect:
-        if websocket in hub.clients:hub.clients.remove(websocket)
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        hub.remove(websocket)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await asyncio.wait_for(websocket.close(), timeout=1)
+        except Exception:
+            pass
 
 
 @app.get("/api/display")
@@ -769,7 +858,7 @@ def display_page():
     async function refresh(){if(refreshing){pending=true;return}refreshing=true;try{const r=await fetch('/api/display',{cache:'no-store'});if(!r.ok)throw Error();const data=await r.json();updateAuctionClock(data);render(data)}catch(e){el('connection').textContent='Connection interrupted - retrying'}finally{refreshing=false;if(pending){pending=false;refresh()}}}
     function connect(){clearTimeout(retry);socket=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws');socket.onopen=()=>{el('connection').textContent='Connected';refresh()};socket.onmessage=refresh;socket.onclose=()=>{el('connection').textContent='Reconnecting...';retry=setTimeout(connect,3000)};socket.onerror=()=>socket.close()}
     function resume(){refresh();if(!socket||socket.readyState===WebSocket.CLOSED)connect()}
-    window.addEventListener('online',resume);document.addEventListener('visibilitychange',()=>{if(!document.hidden)resume()});refresh();connect();setInterval(()=>{if(!document.hidden)refresh()},1000);
+    window.addEventListener('online',resume);document.addEventListener('visibilitychange',()=>{if(!document.hidden)resume()});refresh();connect();let pollTick=0;setInterval(()=>{if(!document.hidden&&(!socket||socket.readyState!==WebSocket.OPEN||++pollTick%5===0))refresh()},1000);
     </script>''')
 
 
@@ -820,7 +909,7 @@ def participant_page(request):
     el('next').onclick=()=>{const amount=(state.auction.high||0)+1;if(confirm('Submit '+amount+' points for '+state.auction.prize+'?'))submit(amount)};
     function heartbeat(){fetch('/heartbeat',{method:'POST'}).catch(()=>{})}
     window.addEventListener('online',()=>{refresh();if(!socket||socket.readyState===WebSocket.CLOSED)connect()});document.addEventListener('visibilitychange',()=>{if(!document.hidden){refresh();heartbeat();if(!socket||socket.readyState===WebSocket.CLOSED)connect()}});
-    refresh();connect();heartbeat();setInterval(heartbeat,10000);setInterval(()=>{if(!document.hidden)refresh()},1000);
+    refresh();connect();heartbeat();setInterval(heartbeat,10000);let pollTick=0;setInterval(()=>{if(!document.hidden&&(!socket||socket.readyState!==WebSocket.OPEN||++pollTick%5===0))refresh()},1000);
     </script>''')
 
 
@@ -876,4 +965,4 @@ async def confirm_import(request:Request,token:str=Form(...)):
 
 if __name__=="__main__":
     import uvicorn
-    uvicorn.run("main:app",host="127.0.0.1",port=8000,proxy_headers=True,forwarded_allow_ips="127.0.0.1")
+    uvicorn.run("main:app",host="127.0.0.1",port=8000,timeout_keep_alive=30,proxy_headers=True,forwarded_allow_ips="127.0.0.1")

@@ -12,3 +12,6 @@ This project is prepared for a single paid Python web service with a 1 GB persis
 8. Share the service HTTPS URL after validation. Stop using the old temporary tunnel address.
 
 Keep one service instance and one Uvicorn worker: live update connections are held in memory, and SQLite lives on the attached disk. Database and backups use `/var/data` and survive restarts and deploys. Avoid deploying while an auction is open because an attached disk causes a short restart gap.
+
+
+The capacity update uses the start command `uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1 --timeout-keep-alive 30`. Keep the existing persistent disk and session secret when upgrading. Deploy only after the current auction is awarded or cancelled. Validate a disposable matching hosted instance with 70 and 100 users before relying on event capacity.
